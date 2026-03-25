@@ -1,0 +1,2922 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+RSH ÉPIDÉMIO v3 — Système de Surveillance Épidémiologique
+Région MADAGASCAR — Réseau de Surveillance Hebdomadaire (RSH)
+Version 3.0 — Architecture décentralisée, gestion utilisateurs complète,
+              import URL réseau, stockage multi-années
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+import sqlite3, os, json, hashlib, re, threading
+from datetime import datetime
+from pathlib import Path
+import urllib.request
+import urllib.error
+import io
+
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.gridspec import GridSpec
+import warnings
+warnings.filterwarnings('ignore')
+
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+# ═══════════════════════════════════════════════════════════════
+#  CONFIGURATION LOCALE — Modifier selon l'installation
+# ═══════════════════════════════════════════════════════════════
+
+APP_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = APP_DIR / "data"
+DB_PATH = DATA_DIR / "rsh_epidemio_v3.db"
+CONFIG_PATH = APP_DIR / "config.json"
+
+DATA_DIR.mkdir(exist_ok=True)
+
+# ═══════════════════════════════════════════════════════════════
+#  PALETTE & CONSTANTES
+# ═══════════════════════════════════════════════════════════════
+
+C = {
+    'bg':      '#0d1b2a', 'panel':   '#1b2d3e', 'card':    '#1f3649',
+    'accent':  '#00b4d8', 'accent2': '#90e0ef', 'green':   '#2ecc71',
+    'yellow':  '#f39c12', 'orange':  '#e67e22', 'red':     '#e74c3c',
+    'purple':  '#9b59b6', 'teal':    '#1abc9c', 'text':    '#e8f4f8',
+    'subtext': '#8ab4c8', 'border':  '#2d4a63', 'white':   '#ffffff',
+    'alert1':  '#f39c12', 'alert2':  '#e74c3c',
+}
+
+DISTRICT_COLORS = ['#00b4d8','#2ecc71','#f39c12','#e74c3c','#9b59b6',
+                   '#1abc9c','#e67e22','#3498db','#f1c40f','#e91e63']
+
+ROLES = {
+    'admin':     'Administrateur National',
+    'national':  'Utilisateur National',
+    'region':    'Utilisateur Régional',
+    'district':  'Utilisateur District',
+    'lecteur':   'Lecteur (lecture seule)',
+}
+
+MALADIES_PRIORITAIRES = [
+    'Paludisme Confirmé','Paludisme grave','Fièvre (T≥37°5C) nombre de cas ',
+    'Choléra','Rougeole','Méningite     ','Peste Bubonique','Peste Pulmonaire',
+    'Diarrhée aiguë sans déshydratation chez les moins de 5 ans',
+    'Diarrhée aiguë avec déshydratation chez les moins de 5 ans',
+    'Dysenterie','Fièvre Typhoïde     ','Infection respiratoire aigue (IRA)',
+    'Pneumonie ','Syndrome grippal','Arbovirose (cas suspect)',
+    'Fièvre hémorragique      aigüe','Rage humaine (cas suspect)',
+    'VIH Nouveaux cas','Tuberculose',
+]
+
+SEUILS_METHODE = {
+    'Choléra': {'alerte':1,'epidemie':3}, 'Rougeole': {'alerte':2,'epidemie':5},
+    'Méningite     ': {'alerte':3,'epidemie':8},
+    'Peste Bubonique': {'alerte':1,'epidemie':2}, 'Peste Pulmonaire': {'alerte':1,'epidemie':1},
+    'Arbovirose (cas suspect)': {'alerte':3,'epidemie':8},
+}
+
+ANNEE_COURANTE = datetime.now().year
+
+# ═══════════════════════════════════════════════════════════════
+#  BASE DE DONNÉES — SCHÉMA v3 MULTI-ANNÉES
+# ═══════════════════════════════════════════════════════════════
+
+class DatabaseManager:
+    def __init__(self, db_path=None):
+        self.db_path = str(db_path or DB_PATH)
+        self._init_db()
+
+    def _conn(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    def _init_db(self):
+        conn = self._conn()
+        c = conn.cursor()
+
+        # ── Utilisateurs avec périmètre géographique ─────────────
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            nom_complet TEXT DEFAULT '',
+            email TEXT DEFAULT '',
+            role TEXT DEFAULT 'lecteur',
+            perimetre TEXT DEFAULT 'TOUS',
+            region TEXT DEFAULT 'TOUS',
+            district TEXT DEFAULT 'TOUS',
+            actif INTEGER DEFAULT 1,
+            created_by INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP
+        )''')
+
+        # ── Sources de données (fichiers/URL) ─────────────────────
+        c.execute('''CREATE TABLE IF NOT EXISTS sources_donnees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nom TEXT NOT NULL,
+            type_source TEXT DEFAULT 'fichier',
+            url TEXT,
+            district TEXT,
+            region TEXT,
+            actif INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+
+        # ── Formations sanitaires ─────────────────────────────────
+        c.execute('''CREATE TABLE IF NOT EXISTS formations_sanitaires (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            numero TEXT, nom TEXT NOT NULL, district TEXT NOT NULL,
+            region TEXT NOT NULL, population INTEGER, type_fs TEXT DEFAULT 'CSB',
+            UNIQUE(nom, district)
+        )''')
+
+        # ── Données consultation (multi-années) ───────────────────
+        c.execute('''CREATE TABLE IF NOT EXISTS donnees_consultation (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            region TEXT NOT NULL, district TEXT NOT NULL, csb TEXT NOT NULL,
+            semaine TEXT NOT NULL, annee INTEGER NOT NULL DEFAULT 2025,
+            maladie TEXT NOT NULL,
+            cas_vivants INTEGER DEFAULT 0, cas_deces INTEGER DEFAULT 0,
+            source_import TEXT,
+            imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(region, district, csb, semaine, annee, maladie)
+        )''')
+
+        # ── Données district agrégées ─────────────────────────────
+        c.execute('''CREATE TABLE IF NOT EXISTS donnees_district (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            region TEXT NOT NULL, district TEXT NOT NULL,
+            semaine INTEGER NOT NULL, annee INTEGER NOT NULL DEFAULT 2025,
+            nb_fsf INTEGER DEFAULT 0, nb_fsn INTEGER DEFAULT 0, nb_fs_temp INTEGER DEFAULT 0,
+            maladie TEXT NOT NULL, cas_total INTEGER DEFAULT 0,
+            imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(region, district, semaine, annee, maladie)
+        )''')
+
+        # ── Paludisme ─────────────────────────────────────────────
+        c.execute('''CREATE TABLE IF NOT EXISTS paludisme (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            region TEXT NOT NULL, district TEXT NOT NULL, csb TEXT NOT NULL,
+            semaine TEXT NOT NULL, annee INTEGER NOT NULL DEFAULT 2025,
+            cas_fievre INTEGER DEFAULT 0, palu_simple INTEGER DEFAULT 0,
+            nb_tdr INTEGER DEFAULT 0, palu_grave INTEGER DEFAULT 0,
+            deces_palu INTEGER DEFAULT 0, total_consultants INTEGER DEFAULT 0,
+            imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(region, district, csb, semaine, annee)
+        )''')
+
+        # ── Complétude FS ─────────────────────────────────────────
+        c.execute('''CREATE TABLE IF NOT EXISTS completude_fs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            region TEXT NOT NULL, district TEXT NOT NULL, csb TEXT NOT NULL,
+            semaine TEXT NOT NULL, annee INTEGER NOT NULL DEFAULT 2025,
+            a_rapporte INTEGER DEFAULT 0,
+            imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(region, district, csb, semaine, annee)
+        )''')
+
+        # ── Événements humains ────────────────────────────────────
+        c.execute('''CREATE TABLE IF NOT EXISTS evenements_humains (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            region TEXT, district TEXT NOT NULL, csb TEXT,
+            semaine TEXT NOT NULL, annee INTEGER NOT NULL DEFAULT 2025,
+            evenement TEXT NOT NULL,
+            cas_vivants INTEGER DEFAULT 0, cas_deces INTEGER DEFAULT 0,
+            imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+
+        # ── Événements animaux ────────────────────────────────────
+        c.execute('''CREATE TABLE IF NOT EXISTS evenements_animaux (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            region TEXT, district TEXT NOT NULL, csb TEXT,
+            semaine TEXT NOT NULL, annee INTEGER NOT NULL DEFAULT 2025,
+            evenement TEXT NOT NULL, existant INTEGER DEFAULT 0, nombre INTEGER DEFAULT 0,
+            imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+
+        # ── Seuils d'alerte ───────────────────────────────────────
+        c.execute('''CREATE TABLE IF NOT EXISTS seuils_alerte (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            region TEXT, district TEXT NOT NULL, maladie TEXT NOT NULL,
+            seuil_alerte REAL, seuil_epidemie REAL,
+            methode TEXT DEFAULT 'percentile', annee_reference INTEGER,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(district, maladie)
+        )''')
+
+        # ── Alertes ───────────────────────────────────────────────
+        c.execute('''CREATE TABLE IF NOT EXISTS alertes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            region TEXT, district TEXT NOT NULL, csb TEXT,
+            semaine TEXT NOT NULL, annee INTEGER NOT NULL DEFAULT 2025,
+            maladie TEXT NOT NULL, valeur_observee REAL,
+            seuil_franchi TEXT, niveau TEXT, statut TEXT DEFAULT 'nouveau',
+            commentaire TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+
+        # ── Log des imports ───────────────────────────────────────
+        c.execute('''CREATE TABLE IF NOT EXISTS import_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            region TEXT, district TEXT, fichier TEXT,
+            nb_enregistrements INTEGER, statut TEXT, message TEXT,
+            annee INTEGER, source_type TEXT DEFAULT 'fichier',
+            imported_by INTEGER,
+            imported_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+
+        # Index pour performance
+        c.execute("CREATE INDEX IF NOT EXISTS idx_dc_annee ON donnees_consultation(annee)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_dc_district ON donnees_consultation(district)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_dc_semaine ON donnees_consultation(semaine)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_dc_maladie ON donnees_consultation(maladie)")
+
+        # Compte admin par défaut
+        try:
+            pwd = hashlib.sha256('admin123'.encode()).hexdigest()
+            c.execute(
+                "INSERT OR IGNORE INTO users (username,password,nom_complet,role,perimetre,region,district) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ('admin', pwd, 'Administrateur Système', 'admin', 'TOUS', 'TOUS', 'TOUS'))
+        except Exception:
+            pass
+
+        conn.commit()
+        conn.close()
+
+    def hash_pwd(self, pwd):
+        return hashlib.sha256(pwd.encode()).hexdigest()
+
+    def authenticate(self, username, password):
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT id, role, district, region, perimetre, nom_complet, actif "
+            "FROM users WHERE username=? AND password=?",
+            (username, self.hash_pwd(password))).fetchone()
+        if row and row['actif']:
+            conn.execute("UPDATE users SET last_login=? WHERE username=?",
+                         (datetime.now().isoformat(), username))
+            conn.commit()
+        conn.close()
+        return row if (row and row['actif']) else None
+
+    # ── GESTION UTILISATEURS ─────────────────────────────────────
+
+    def get_all_users(self):
+        conn = self._conn()
+        df = pd.read_sql_query(
+            "SELECT id, username, nom_complet, email, role, perimetre, region, district, "
+            "actif, created_at, last_login FROM users ORDER BY username", conn)
+        conn.close()
+        return df
+
+    def create_user(self, username, password, nom_complet, email, role,
+                    perimetre, region, district, created_by=None):
+        conn = self._conn()
+        try:
+            conn.execute(
+                "INSERT INTO users (username,password,nom_complet,email,role,"
+                "perimetre,region,district,created_by) VALUES (?,?,?,?,?,?,?,?,?)",
+                (username, self.hash_pwd(password), nom_complet, email,
+                 role, perimetre, region, district, created_by))
+            conn.commit()
+            return True, "Compte créé avec succès."
+        except sqlite3.IntegrityError:
+            return False, "Nom d'utilisateur déjà existant."
+        except Exception as e:
+            return False, str(e)
+        finally:
+            conn.close()
+
+    def update_user(self, user_id, nom_complet, email, role, perimetre, region, district, actif):
+        conn = self._conn()
+        try:
+            conn.execute(
+                "UPDATE users SET nom_complet=?,email=?,role=?,perimetre=?,"
+                "region=?,district=?,actif=? WHERE id=?",
+                (nom_complet, email, role, perimetre, region, district, actif, user_id))
+            conn.commit()
+            return True, "Utilisateur mis à jour."
+        except Exception as e:
+            return False, str(e)
+        finally:
+            conn.close()
+
+    def reset_password(self, user_id, new_password):
+        conn = self._conn()
+        try:
+            conn.execute("UPDATE users SET password=? WHERE id=?",
+                         (self.hash_pwd(new_password), user_id))
+            conn.commit()
+            return True, "Mot de passe réinitialisé."
+        except Exception as e:
+            return False, str(e)
+        finally:
+            conn.close()
+
+    def delete_user(self, user_id):
+        conn = self._conn()
+        try:
+            conn.execute("UPDATE users SET actif=0 WHERE id=?", (user_id,))
+            conn.commit()
+            return True, "Utilisateur désactivé."
+        except Exception as e:
+            return False, str(e)
+        finally:
+            conn.close()
+
+    def change_own_password(self, user_id, old_password, new_password):
+        conn = self._conn()
+        row = conn.execute("SELECT id FROM users WHERE id=? AND password=?",
+                           (user_id, self.hash_pwd(old_password))).fetchone()
+        if not row:
+            conn.close()
+            return False, "Ancien mot de passe incorrect."
+        conn.execute("UPDATE users SET password=? WHERE id=?",
+                     (self.hash_pwd(new_password), user_id))
+        conn.commit()
+        conn.close()
+        return True, "Mot de passe changé avec succès."
+
+    # ── SOURCES DE DONNÉES (URLs réseau) ─────────────────────────
+
+    def get_sources(self):
+        conn = self._conn()
+        df = pd.read_sql_query("SELECT * FROM sources_donnees ORDER BY nom", conn)
+        conn.close()
+        return df
+
+    def add_source(self, nom, type_source, url, district, region):
+        conn = self._conn()
+        try:
+            conn.execute(
+                "INSERT INTO sources_donnees (nom,type_source,url,district,region) VALUES (?,?,?,?,?)",
+                (nom, type_source, url, district, region))
+            conn.commit()
+            return True, "Source ajoutée."
+        except Exception as e:
+            return False, str(e)
+        finally:
+            conn.close()
+
+    def delete_source(self, source_id):
+        conn = self._conn()
+        conn.execute("UPDATE sources_donnees SET actif=0 WHERE id=?", (source_id,))
+        conn.commit()
+        conn.close()
+
+    # ── LISTES & FILTRES ─────────────────────────────────────────
+
+    def get_annees_disponibles(self):
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT DISTINCT annee FROM donnees_consultation ORDER BY annee DESC").fetchall()
+        conn.close()
+        annees = [r[0] for r in rows]
+        return annees if annees else [ANNEE_COURANTE]
+
+    def get_regions(self, annee=None):
+        conn = self._conn()
+        if annee:
+            rows = conn.execute(
+                "SELECT DISTINCT region FROM donnees_consultation WHERE annee=? ORDER BY region",
+                (annee,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT region FROM donnees_consultation ORDER BY region").fetchall()
+        conn.close()
+        return [r[0] for r in rows if r[0]]
+
+    def get_districts(self, region=None, annee=None):
+        conn = self._conn()
+        conds, params = [], []
+        if region and region != 'TOUS':
+            conds.append("region=?"); params.append(region)
+        if annee:
+            conds.append("annee=?"); params.append(annee)
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+        rows = conn.execute(
+            f"SELECT DISTINCT district FROM donnees_consultation {where} ORDER BY district",
+            params).fetchall()
+        conn.close()
+        return [r[0] for r in rows if r[0]]
+
+    def get_semaines_disponibles(self, annee=None, district=None):
+        conn = self._conn()
+        conds, params = [], []
+        if annee:
+            conds.append("annee=?"); params.append(annee)
+        if district and district != 'TOUS':
+            conds.append("district=?"); params.append(district)
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+        rows = conn.execute(
+            f"SELECT DISTINCT semaine FROM donnees_consultation {where} "
+            "ORDER BY CAST(SUBSTR(semaine,2) AS INTEGER)", params).fetchall()
+        conn.close()
+        return [r[0] for r in rows]
+
+    def get_csb_list(self, district=None, annee=None):
+        conn = self._conn()
+        conds, params = [], []
+        if district and district != 'TOUS':
+            conds.append("district=?"); params.append(district)
+        if annee:
+            conds.append("annee=?"); params.append(annee)
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+        rows = conn.execute(
+            f"SELECT DISTINCT csb FROM donnees_consultation {where} ORDER BY csb",
+            params).fetchall()
+        conn.close()
+        return [r[0] for r in rows if r[0]]
+
+    def get_maladies_list(self, district=None, annee=None):
+        conn = self._conn()
+        conds, params = ["cas_vivants>0"], []
+        if district and district != 'TOUS':
+            conds.append("district=?"); params.append(district)
+        if annee:
+            conds.append("annee=?"); params.append(annee)
+        rows = conn.execute(
+            f"SELECT DISTINCT maladie FROM donnees_consultation "
+            f"WHERE {' AND '.join(conds)} ORDER BY maladie", params).fetchall()
+        conn.close()
+        return [r[0] for r in rows if r[0]]
+
+    # ── DONNÉES ──────────────────────────────────────────────────
+
+    def get_donnees_semaine(self, semaine, annee=None, district=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        conds = ["semaine=?", "annee=?"]
+        params = [semaine, annee]
+        if district and district != 'TOUS':
+            conds.append("district=?"); params.append(district)
+        df = pd.read_sql_query(
+            f"SELECT district, csb, maladie, SUM(cas_vivants) as cas, SUM(cas_deces) as deces "
+            f"FROM donnees_consultation WHERE {' AND '.join(conds)} "
+            f"GROUP BY district, csb, maladie",
+            conn, params=params)
+        conn.close()
+        return df
+
+    def get_serie_temporelle(self, maladie, annee=None, district=None, csb=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        conds = ["maladie=?", "annee=?"]
+        params = [maladie, annee]
+        if csb:
+            conds.append("csb=?"); params.append(csb)
+        elif district and district != 'TOUS':
+            conds.append("district=?"); params.append(district)
+        grp = "semaine, district" if not csb else "semaine, csb"
+        df = pd.read_sql_query(
+            f"SELECT semaine, district, SUM(cas_vivants) as cas, SUM(cas_deces) as deces "
+            f"FROM donnees_consultation WHERE {' AND '.join(conds)} "
+            f"GROUP BY {grp} ORDER BY CAST(SUBSTR(semaine,2) AS INTEGER)",
+            conn, params=params)
+        conn.close()
+        return df
+
+    def get_comparaison_annees(self, maladie, district=None):
+        """Comparaison inter-annuelle pour une maladie."""
+        conn = self._conn()
+        conds = ["maladie=?"]
+        params = [maladie]
+        if district and district != 'TOUS':
+            conds.append("district=?"); params.append(district)
+        df = pd.read_sql_query(
+            f"SELECT annee, semaine, SUM(cas_vivants) as cas "
+            f"FROM donnees_consultation WHERE {' AND '.join(conds)} "
+            f"GROUP BY annee, semaine ORDER BY annee, CAST(SUBSTR(semaine,2) AS INTEGER)",
+            conn, params=params)
+        conn.close()
+        return df
+
+    def get_resume_district_semaine(self, semaine, annee=None, district=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        conds = ["semaine=?", "annee=?"]
+        params = [semaine, annee]
+        if district and district != 'TOUS':
+            conds.append("district=?"); params.append(district)
+        df = pd.read_sql_query(
+            f"SELECT maladie, SUM(cas_vivants) as total_cas, SUM(cas_deces) as total_deces, "
+            f"COUNT(DISTINCT csb) as nb_csb "
+            f"FROM donnees_consultation WHERE {' AND '.join(conds)} "
+            f"GROUP BY maladie ORDER BY total_cas DESC",
+            conn, params=params)
+        conn.close()
+        return df
+
+    def get_comparaison_districts(self, maladie, annee=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        df = pd.read_sql_query(
+            "SELECT district, region, semaine, SUM(cas_vivants) as cas "
+            "FROM donnees_consultation WHERE maladie=? AND annee=? "
+            "GROUP BY district, semaine ORDER BY district, CAST(SUBSTR(semaine,2) AS INTEGER)",
+            conn, params=(maladie, annee))
+        conn.close()
+        return df
+
+    def get_top_maladies_tous_districts(self, semaine, annee=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        df = pd.read_sql_query(
+            "SELECT maladie, SUM(cas_vivants) as total_cas, COUNT(DISTINCT district) as nb_districts "
+            "FROM donnees_consultation WHERE semaine=? AND annee=? "
+            "AND maladie != 'Total Nouveaux consultants' "
+            "GROUP BY maladie ORDER BY total_cas DESC LIMIT 15",
+            conn, params=(semaine, annee))
+        conn.close()
+        return df
+
+    def get_tableau_bord_districts(self, semaine, annee=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        df = pd.read_sql_query(
+            "SELECT district, region, "
+            "SUM(CASE WHEN maladie='Total Nouveaux consultants' THEN cas_vivants ELSE 0 END) as consultations, "
+            "COUNT(DISTINCT csb) as nb_csb, "
+            "SUM(CASE WHEN maladie='Paludisme Confirmé' THEN cas_vivants ELSE 0 END) as palu, "
+            "SUM(CASE WHEN maladie='Infection respiratoire aigue (IRA)' THEN cas_vivants ELSE 0 END) as ira "
+            "FROM donnees_consultation WHERE semaine=? AND annee=? "
+            "GROUP BY district ORDER BY consultations DESC",
+            conn, params=(semaine, annee))
+        conn.close()
+        return df
+
+    def get_paludisme_serie(self, annee=None, district=None, csb=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        conds = ["annee=?"]
+        params = [annee]
+        if csb:
+            conds.append("csb=?"); params.append(csb)
+        elif district and district != 'TOUS':
+            conds.append("district=?"); params.append(district)
+        grp = "semaine, district" if not csb else "semaine"
+        df = pd.read_sql_query(
+            f"SELECT semaine, district, SUM(cas_fievre) as fievre, SUM(palu_simple) as palu_simple, "
+            f"SUM(palu_grave) as palu_grave, SUM(deces_palu) as deces, SUM(nb_tdr) as tdr "
+            f"FROM paludisme WHERE {' AND '.join(conds)} GROUP BY {grp} "
+            f"ORDER BY CAST(SUBSTR(semaine,2) AS INTEGER)",
+            conn, params=params)
+        conn.close()
+        return df
+
+    def get_completude_serie(self, annee=None, district=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        conds = ["annee=?"]
+        params = [annee]
+        if district and district != 'TOUS':
+            conds.append("district=?"); params.append(district)
+        grp = "district, semaine" if not district or district == 'TOUS' else "semaine"
+        df = pd.read_sql_query(
+            f"SELECT {grp}, SUM(a_rapporte) as rapporte, COUNT(*) as total_fs "
+            f"FROM completude_fs WHERE {' AND '.join(conds)} GROUP BY {grp} "
+            f"ORDER BY CAST(SUBSTR(semaine,2) AS INTEGER)",
+            conn, params=params)
+        conn.close()
+        return df
+
+    def get_completude_par_district(self, annee=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        df = pd.read_sql_query(
+            "SELECT district, region, "
+            "ROUND(AVG(CAST(a_rapporte AS REAL))*100, 1) as taux_moyen, "
+            "COUNT(DISTINCT csb) as nb_csb "
+            "FROM completude_fs WHERE annee=? GROUP BY district ORDER BY taux_moyen DESC",
+            conn, params=(annee,))
+        conn.close()
+        return df
+
+    def calculer_et_sauver_seuils(self, annee=None, district=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        if district and district != 'TOUS':
+            districts = [district]
+        else:
+            rows = conn.execute("SELECT DISTINCT district FROM donnees_consultation").fetchall()
+            districts = [r[0] for r in rows]
+        seuils = []
+        for dist in districts:
+            maladies = pd.read_sql_query(
+                "SELECT DISTINCT maladie FROM donnees_consultation WHERE cas_vivants>0 AND district=?",
+                conn, params=(dist,))['maladie'].tolist()
+            for maladie in maladies:
+                df = pd.read_sql_query(
+                    "SELECT semaine, SUM(cas_vivants) as cas FROM donnees_consultation "
+                    "WHERE maladie=? AND annee=? AND district=? GROUP BY semaine",
+                    conn, params=(maladie, annee, dist))
+                if len(df) >= 3:
+                    vals = df['cas'].values
+                    s_a = float(np.percentile(vals, 75))
+                    s_e = float(np.percentile(vals, 90))
+                else:
+                    s_a = SEUILS_METHODE.get(maladie, {}).get('alerte')
+                    s_e = SEUILS_METHODE.get(maladie, {}).get('epidemie')
+                if s_a is not None:
+                    seuils.append((dist, maladie, s_a, s_e, 'percentile_75_90', annee))
+        conn.executemany(
+            "INSERT OR REPLACE INTO seuils_alerte (district, maladie, seuil_alerte, seuil_epidemie, methode, annee_reference) "
+            "VALUES (?,?,?,?,?,?)", seuils)
+        conn.commit()
+        conn.close()
+        return len(seuils)
+
+    def get_seuils(self, district=None):
+        conn = self._conn()
+        cond = "WHERE district=?" if (district and district != 'TOUS') else ""
+        params = (district,) if (district and district != 'TOUS') else ()
+        df = pd.read_sql_query(
+            f"SELECT district, maladie, seuil_alerte, seuil_epidemie, methode FROM seuils_alerte {cond}",
+            conn, params=params)
+        conn.close()
+        return df
+
+    def detecter_alertes(self, semaine, annee=None, district=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        cond_d = " AND district=?" if (district and district != 'TOUS') else ""
+        params_s = (semaine, annee, district) if (district and district != 'TOUS') else (semaine, annee)
+        seuils_df = pd.read_sql_query(
+            "SELECT district, maladie, seuil_alerte, seuil_epidemie FROM seuils_alerte"
+            + (f" WHERE district=?" if (district and district != 'TOUS') else ""),
+            conn, params=((district,) if (district and district != 'TOUS') else ()))
+        seuils = {(r['district'], r['maladie']): r for _, r in seuils_df.iterrows()}
+        cas_df = pd.read_sql_query(
+            f"SELECT district, region, csb, maladie, SUM(cas_vivants) as cas "
+            f"FROM donnees_consultation WHERE semaine=? AND annee=? {cond_d} "
+            f"GROUP BY district, csb, maladie", conn, params=params_s)
+        alertes = []
+        for _, row in cas_df.iterrows():
+            key = (row['district'], row['maladie'])
+            if key not in seuils or row['cas'] == 0:
+                continue
+            s = seuils[key]
+            niveau = None
+            if s['seuil_epidemie'] and row['cas'] >= s['seuil_epidemie']:
+                niveau = 'ÉPIDÉMIE'
+            elif s['seuil_alerte'] and row['cas'] >= s['seuil_alerte']:
+                niveau = 'ALERTE'
+            if niveau:
+                alertes.append({
+                    'district': row['district'], 'region': row.get('region', ''),
+                    'csb': row['csb'], 'semaine': semaine, 'annee': annee,
+                    'maladie': row['maladie'], 'valeur_observee': row['cas'],
+                    'seuil_franchi': f"A:{s['seuil_alerte']:.1f}/E:{s['seuil_epidemie']:.1f}",
+                    'niveau': niveau
+                })
+        conn.execute(
+            f"DELETE FROM alertes WHERE semaine=? AND annee=? {cond_d}",
+            params_s)
+        for a in alertes:
+            conn.execute(
+                "INSERT INTO alertes (district,region,csb,semaine,annee,maladie,valeur_observee,seuil_franchi,niveau) "
+                "VALUES (:district,:region,:csb,:semaine,:annee,:maladie,:valeur_observee,:seuil_franchi,:niveau)", a)
+        conn.commit()
+        conn.close()
+        return alertes
+
+    def get_alertes(self, semaine=None, annee=None, district=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        conds, params = ["annee=?"], [annee]
+        if semaine:
+            conds.append("semaine=?"); params.append(semaine)
+        if district and district != 'TOUS':
+            conds.append("district=?"); params.append(district)
+        df = pd.read_sql_query(
+            f"SELECT * FROM alertes WHERE {' AND '.join(conds)} "
+            "ORDER BY niveau DESC, valeur_observee DESC LIMIT 500",
+            conn, params=params)
+        conn.close()
+        return df
+
+    def get_alertes_synthese_districts(self, annee=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        df = pd.read_sql_query(
+            "SELECT district, region, niveau, COUNT(*) as nb "
+            "FROM alertes WHERE annee=? GROUP BY district, niveau ORDER BY district",
+            conn, params=(annee,))
+        conn.close()
+        return df
+
+    def get_stats_generales(self, annee=None, district=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        cond = f"AND district='{district}'" if (district and district != 'TOUS') else ""
+        stats = {
+            'total_consultations': conn.execute(
+                f"SELECT SUM(cas_vivants) FROM donnees_consultation "
+                f"WHERE maladie='Total Nouveaux consultants' AND annee=? {cond}", (annee,)).fetchone()[0] or 0,
+            'nb_semaines': conn.execute(
+                f"SELECT COUNT(DISTINCT semaine) FROM donnees_consultation WHERE annee=? {cond}", (annee,)).fetchone()[0] or 0,
+            'nb_csb': conn.execute(
+                f"SELECT COUNT(DISTINCT csb) FROM donnees_consultation WHERE annee=? {cond}", (annee,)).fetchone()[0] or 0,
+            'nb_districts': conn.execute(
+                f"SELECT COUNT(DISTINCT district) FROM donnees_consultation WHERE annee=? {cond}", (annee,)).fetchone()[0] or 0,
+            'nb_alertes': conn.execute(
+                f"SELECT COUNT(*) FROM alertes WHERE annee=? {cond}", (annee,)).fetchone()[0] or 0,
+            'nb_alertes_epidemie': conn.execute(
+                f"SELECT COUNT(*) FROM alertes WHERE annee=? AND niveau='ÉPIDÉMIE' {cond}", (annee,)).fetchone()[0] or 0,
+        }
+        conn.close()
+        return stats
+
+    def get_import_log(self, limit=100):
+        conn = self._conn()
+        df = pd.read_sql_query(
+            "SELECT * FROM import_log ORDER BY imported_at DESC LIMIT ?", conn, params=(limit,))
+        conn.close()
+        return df
+
+    def get_evenements_humains(self, semaine=None, annee=None, district=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        conds, params = ["annee=?"], [annee]
+        if semaine:
+            conds.append("semaine=?"); params.append(semaine)
+        if district and district != 'TOUS':
+            conds.append("district=?"); params.append(district)
+        df = pd.read_sql_query(
+            f"SELECT district, semaine, evenement, SUM(cas_vivants) as vivants, SUM(cas_deces) as deces "
+            f"FROM evenements_humains WHERE {' AND '.join(conds)} "
+            f"GROUP BY district, semaine, evenement ORDER BY semaine",
+            conn, params=params)
+        conn.close()
+        return df
+
+    def get_evenements_animaux(self, semaine=None, annee=None, district=None):
+        conn = self._conn()
+        annee = annee or ANNEE_COURANTE
+        conds, params = ["annee=?"], [annee]
+        if semaine:
+            conds.append("semaine=?"); params.append(semaine)
+        if district and district != 'TOUS':
+            conds.append("district=?"); params.append(district)
+        df = pd.read_sql_query(
+            f"SELECT district, semaine, evenement, SUM(existant) as existant, SUM(nombre) as nombre "
+            f"FROM evenements_animaux WHERE {' AND '.join(conds)} "
+            f"GROUP BY district, semaine, evenement ORDER BY semaine",
+            conn, params=params)
+        conn.close()
+        return df
+
+
+# ═══════════════════════════════════════════════════════════════
+#  IMPORTATEUR RSH v3 — FICHIER + URL RÉSEAU
+# ═══════════════════════════════════════════════════════════════
+
+class ImportateurRSH:
+    def __init__(self, db: DatabaseManager, annee=None, progress_callback=None):
+        self.db = db
+        self.annee = annee or ANNEE_COURANTE
+        self.progress = progress_callback or (lambda msg, pct: None)
+        self.region = None
+        self.district = None
+
+    @staticmethod
+    def _safe_rows(ws):
+        try:
+            return list(ws.iter_rows(values_only=True))
+        except Exception:
+            rows = []
+            try:
+                for row in ws.rows:
+                    rows.append(tuple(cell.value for cell in row))
+            except Exception:
+                pass
+            return rows
+
+    @staticmethod
+    def _safe_int(v):
+        if v is None: return 0
+        try: return int(float(str(v).replace(',', '.')))
+        except: return 0
+
+    def _detect_district_region(self, wb):
+        region, district = None, None
+        if 'Liste Formation sanitaire' in wb.sheetnames:
+            rows = self._safe_rows(wb['Liste Formation sanitaire'])
+            for r in rows[:10]:
+                if r[0] and 'Region' in str(r[0]):
+                    region = str(r[1]).strip() if r[1] else None
+                if r[0] and 'District' in str(r[0]):
+                    district = str(r[1]).strip() if r[1] else None
+        if not district and 'BDD-CSB' in wb.sheetnames:
+            rows = self._safe_rows(wb['BDD-CSB'])
+            if len(rows) > 1 and rows[1][1]:
+                district = str(rows[1][1]).strip()
+            if len(rows) > 1 and rows[1][0]:
+                region = str(rows[1][0]).strip()
+        return region or 'INCONNUE', district or 'INCONNU'
+
+    def importer_depuis_fichier(self, filepath):
+        self.progress("Ouverture du fichier Excel…", 5)
+        wb = openpyxl.load_workbook(filepath, read_only=True, data_only=True)
+        return self._importer_workbook(wb, os.path.basename(filepath), 'fichier')
+
+    def importer_depuis_url(self, url):
+        self.progress(f"Téléchargement depuis {url[:60]}…", 5)
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'RSH-Epidemio/3.0'})
+            with urllib.request.urlopen(req, timeout=60) as response:
+                data = response.read()
+            self.progress("Fichier téléchargé. Analyse en cours…", 15)
+            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+            nom_fichier = url.split('/')[-1].split('?')[0] or 'import_url.xlsx'
+            return self._importer_workbook(wb, nom_fichier, 'url')
+        except urllib.error.URLError as e:
+            return False, f"Erreur réseau : {e}", 'INCONNU'
+        except Exception as e:
+            return False, f"Erreur : {e}", 'INCONNU'
+
+    def _importer_workbook(self, wb, nom_fichier, source_type):
+        sheets = wb.sheetnames
+        self.region, self.district = self._detect_district_region(wb)
+        self.progress(f"District : {self.district} — Région : {self.region} — Année : {self.annee}", 12)
+
+        conn = self.db._conn()
+        total_lignes = 0
+        try:
+            if 'Liste Formation sanitaire' in sheets:
+                self.progress("Import formations sanitaires…", 18)
+                n = self._import_fs(self._safe_rows(wb['Liste Formation sanitaire']), conn)
+                total_lignes += n
+
+            if 'BDD-CSB' in sheets:
+                self.progress("Import données BDD-CSB…", 28)
+                n = self._import_bdd_csb(self._safe_rows(wb['BDD-CSB']), conn)
+                total_lignes += n
+
+            if 'BDD-District Consul Externe' in sheets:
+                self.progress("Import données district…", 42)
+                n = self._import_bdd_district(self._safe_rows(wb['BDD-District Consul Externe']), conn)
+                total_lignes += n
+
+            if 'PALUDISME' in sheets:
+                self.progress("Import données paludisme…", 55)
+                n = self._import_paludisme(self._safe_rows(wb['PALUDISME']), conn)
+                total_lignes += n
+
+            if 'Completude FS' in sheets:
+                self.progress("Import complétude FS…", 65)
+                n = self._import_completude(self._safe_rows(wb['Completude FS']), conn)
+                total_lignes += n
+
+            if 'EVENEMENT HUMAIN' in sheets:
+                self.progress("Import événements humains…", 73)
+                try:
+                    n = self._import_evenements_humains(self._safe_rows(wb['EVENEMENT HUMAIN']), conn)
+                    total_lignes += n
+                except Exception as e:
+                    print(f"Événements humains: {e}")
+
+            if 'EVENEMENT ANIMAL-ENVIRONEMENT' in sheets:
+                self.progress("Import événements animaux…", 80)
+                try:
+                    n = self._import_evenements_animaux(self._safe_rows(wb['EVENEMENT ANIMAL-ENVIRONEMENT']), conn)
+                    total_lignes += n
+                except Exception as e:
+                    print(f"Événements animaux: {e}")
+
+            conn.commit()
+            self.progress("Calcul seuils d'alerte…", 88)
+            self.db.calculer_et_sauver_seuils(self.annee, self.district)
+            self.progress("Détection alertes…", 93)
+            for s in self.db.get_semaines_disponibles(self.annee, self.district):
+                self.db.detecter_alertes(s, self.annee, self.district)
+
+            conn2 = self.db._conn()
+            conn2.execute(
+                "INSERT INTO import_log (region, district, fichier, nb_enregistrements, statut, annee, source_type) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (self.region, self.district, nom_fichier, total_lignes, 'OK', self.annee, source_type))
+            conn2.commit()
+            conn2.close()
+
+            self.progress(f"✅ Import terminé — {total_lignes} enregistrements — {self.district}", 100)
+            return True, total_lignes, self.district
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            conn.rollback()
+            return False, str(e), self.district
+        finally:
+            conn.close()
+
+    def _import_fs(self, rows, conn):
+        conn.execute("DELETE FROM formations_sanitaires WHERE district=?", (self.district,))
+        inserts = []
+        for r in rows[4:]:
+            if r[0] and r[1] and str(r[1]).strip() not in ['Nom Formation Sanitaire ', 'FORMATIONS SANITAIRES']:
+                inserts.append((str(r[0]), str(r[1]).strip(), self.district, self.region,
+                                self._safe_int(r[2]) if len(r) > 2 else None))
+        conn.executemany(
+            "INSERT OR REPLACE INTO formations_sanitaires (numero, nom, district, region, population) VALUES (?,?,?,?,?)",
+            inserts)
+        return len(inserts)
+
+    def _import_bdd_csb(self, rows, conn):
+        conn.execute("DELETE FROM donnees_consultation WHERE district=? AND annee=?", (self.district, self.annee))
+        if not rows: return 0
+        header = [str(h).strip() if h else None for h in rows[0]]
+        disease_cols = {}
+        for i, h in enumerate(header[4:], 4):
+            if h and h not in ('Region', 'District', 'CSB', 'Semaine Epidemio'):
+                disease_cols[i] = h
+        inserts = []
+        for r in rows[1:]:
+            if len(r) < 4: continue
+            region = str(r[0]).strip() if r[0] else self.region
+            district = str(r[1]).strip() if r[1] else self.district
+            csb = str(r[2]).strip() if r[2] else None
+            semaine = str(r[3]).strip() if r[3] else None
+            if not csb or not semaine: continue
+            for col_idx, maladie in disease_cols.items():
+                val = r[col_idx] if col_idx < len(r) else None
+                cas = self._safe_int(val)
+                if cas > 0:
+                    inserts.append((region, district, csb, semaine, self.annee, maladie, cas, 0, 'BDD-CSB'))
+            total_col = 4
+            if header[total_col] == 'Total Nouveaux consultants':
+                val = r[total_col] if total_col < len(r) else 0
+                cas = self._safe_int(val)
+                inserts.append((region, district, csb, semaine, self.annee,
+                                'Total Nouveaux consultants', cas, 0, 'BDD-CSB'))
+        conn.executemany(
+            "INSERT OR REPLACE INTO donnees_consultation "
+            "(region, district, csb, semaine, annee, maladie, cas_vivants, cas_deces, source_import) "
+            "VALUES (?,?,?,?,?,?,?,?,?)", inserts)
+        return len(inserts)
+
+    def _import_bdd_district(self, rows, conn):
+        conn.execute("DELETE FROM donnees_district WHERE district=? AND annee=?", (self.district, self.annee))
+        if not rows: return 0
+        header = [str(h).strip() if h else None for h in rows[0]]
+        disease_cols = {}
+        for i, h in enumerate(header[4:], 4):
+            if h and h not in ('FSF', 'FSN', 'FS(a temp)'):
+                disease_cols[i] = h
+        inserts = []
+        for r in rows[1:]:
+            if not r[0]: continue
+            semaine = self._safe_int(r[0])
+            if semaine == 0: continue
+            for col_idx, maladie in disease_cols.items():
+                val = r[col_idx] if col_idx < len(r) else None
+                inserts.append((self.region, self.district, semaine, self.annee,
+                                self._safe_int(r[1]) if len(r) > 1 else 0,
+                                self._safe_int(r[2]) if len(r) > 2 else 0,
+                                self._safe_int(r[3]) if len(r) > 3 else 0,
+                                maladie, self._safe_int(val)))
+        conn.executemany(
+            "INSERT OR REPLACE INTO donnees_district "
+            "(region, district, semaine, annee, nb_fsf, nb_fsn, nb_fs_temp, maladie, cas_total) "
+            "VALUES (?,?,?,?,?,?,?,?,?)", inserts)
+        return len(inserts)
+
+    def _import_paludisme(self, rows, conn):
+        conn.execute("DELETE FROM paludisme WHERE district=? AND annee=?", (self.district, self.annee))
+        inserts = []
+        current_csb = None
+        csb_data = {}
+        INDICATEURS = {
+            'fievre': ['cas de fievre','fièvre','fievre'],
+            'palu_simple': ['palu simple','paludisme simple'],
+            'tdr': ['tdr','nombre de tdr'],
+            'palu_grave': ['palu grave','paludisme grave'],
+            'deces': ['décès palu','deces palu'],
+            'total': ['total nouveaux','total consultant'],
+        }
+        def match_indicateur(nom):
+            nom_l = nom.lower().strip()
+            for key, patterns in INDICATEURS.items():
+                if any(p in nom_l for p in patterns): return key
+            return None
+        for r in rows:
+            if not r[0]: continue
+            val0 = str(r[0]).strip()
+            ind = match_indicateur(val0)
+            if ind is None:
+                current_csb = val0
+                if current_csb not in csb_data: csb_data[current_csb] = {}
+            elif current_csb:
+                csb_data[current_csb][ind] = list(r[1:])
+        for csb, data in csb_data.items():
+            if not data: continue
+            max_sem = max(len(v) for v in data.values()) if data else 0
+            for s_idx in range(min(max_sem, 53)):
+                semaine = f'S{s_idx+1}'
+                vals = {k: (self._safe_int(data[k][s_idx]) if (k in data and s_idx < len(data[k])) else 0)
+                        for k in ['fievre','palu_simple','tdr','palu_grave','deces','total']}
+                if any(vals[k] > 0 for k in vals):
+                    inserts.append((self.region, self.district, csb, semaine, self.annee,
+                                   vals['fievre'], vals['palu_simple'], vals['tdr'],
+                                   vals['palu_grave'], vals['deces'], vals['total']))
+        conn.executemany(
+            "INSERT OR REPLACE INTO paludisme "
+            "(region, district, csb, semaine, annee, cas_fievre, palu_simple, nb_tdr, palu_grave, deces_palu, total_consultants) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)", inserts)
+        return len(inserts)
+
+    def _import_completude(self, rows, conn):
+        conn.execute("DELETE FROM completude_fs WHERE district=? AND annee=?", (self.district, self.annee))
+        if not rows: return 0
+        header = rows[0]
+        semaine_cols = {}
+        for i, h in enumerate(header):
+            if h and str(h).strip().startswith('S') and str(h).strip()[1:].isdigit():
+                semaine_cols[i] = str(h).strip()
+        inserts = []
+        for r in rows[1:]:
+            if not r[1]: continue
+            csb = str(r[1]).strip()
+            if csb in ('FORMATIONS SANITAIRES', 'Nom Formation Sanitaire'): continue
+            for col_idx, semaine in semaine_cols.items():
+                val = r[col_idx] if col_idx < len(r) else 0
+                a_rapporte = 1 if val and self._safe_int(val) > 0 else 0
+                inserts.append((self.region, self.district, csb, semaine, self.annee, a_rapporte))
+        conn.executemany(
+            "INSERT OR REPLACE INTO completude_fs (region, district, csb, semaine, annee, a_rapporte) VALUES (?,?,?,?,?,?)",
+            inserts)
+        return len(inserts)
+
+    def _import_evenements_humains(self, rows, conn):
+        conn.execute("DELETE FROM evenements_humains WHERE district=? AND annee=?", (self.district, self.annee))
+        if len(rows) < 2: return 0
+        header = rows[0]
+        semaine_positions = {}
+        for i, h in enumerate(header):
+            if h and str(h).strip().startswith('S') and str(h).strip()[1:].isdigit():
+                sem = str(h).strip()
+                if sem not in semaine_positions:
+                    semaine_positions[sem] = {'v': i, 'd': i+1}
+        inserts = []
+        for r in rows[1:]:
+            if not r[1]: continue
+            evenement = str(r[1]).strip()
+            if not evenement or evenement.lower().startswith('code'): continue
+            for semaine, cols in semaine_positions.items():
+                v_col, d_col = cols['v'], cols['d']
+                vivants = self._safe_int(r[v_col] if v_col < len(r) else 0)
+                deces = self._safe_int(r[d_col] if d_col < len(r) else 0)
+                if vivants > 0 or deces > 0:
+                    inserts.append((self.region, self.district, None, semaine, self.annee, evenement, vivants, deces))
+        conn.executemany(
+            "INSERT INTO evenements_humains (region, district, csb, semaine, annee, evenement, cas_vivants, cas_deces) VALUES (?,?,?,?,?,?,?,?)",
+            inserts)
+        return len(inserts)
+
+    def _import_evenements_animaux(self, rows, conn):
+        conn.execute("DELETE FROM evenements_animaux WHERE district=? AND annee=?", (self.district, self.annee))
+        if len(rows) < 2: return 0
+        header = rows[0]
+        semaine_positions = {}
+        for i, h in enumerate(header):
+            if h and str(h).strip().startswith('S') and str(h).strip()[1:].isdigit():
+                sem = str(h).strip()
+                if sem not in semaine_positions:
+                    semaine_positions[sem] = {'e': i, 'n': i+1}
+        inserts = []
+        for r in rows[1:]:
+            evenement = str(r[1]).strip() if r[1] else None
+            if not evenement: continue
+            for semaine, cols in semaine_positions.items():
+                e_col, n_col = cols['e'], cols['n']
+                existant = self._safe_int(r[e_col] if e_col < len(r) else 0)
+                nombre = self._safe_int(r[n_col] if n_col < len(r) else 0)
+                if existant > 0 or nombre > 0:
+                    inserts.append((self.region, self.district, None, semaine, self.annee, evenement, existant, nombre))
+        conn.executemany(
+            "INSERT INTO evenements_animaux (region, district, csb, semaine, annee, evenement, existant, nombre) VALUES (?,?,?,?,?,?,?,?)",
+            inserts)
+        return len(inserts)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  FENÊTRE CRÉATION DE COMPTE (accessible depuis login)
+# ═══════════════════════════════════════════════════════════════
+
+class CreationCompteWindow:
+    """Formulaire de création de compte — demande envoyée à l'admin."""
+    def __init__(self, parent, db: DatabaseManager):
+        self.db = db
+        self.win = tk.Toplevel(parent)
+        self.win.title("Créer un compte — RSH Épidémio v3")
+        self.win.configure(bg=C['bg'])
+        self.win.geometry("500x620")
+        self.win.resizable(False, False)
+        self.win.transient(parent)
+        self.win.grab_set()
+        self._center()
+        self._build()
+
+    def _center(self):
+        self.win.update_idletasks()
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        x, y = (sw - 500)//2, (sh - 620)//2
+        self.win.geometry(f"500x620+{x}+{y}")
+
+    def _field(self, parent, label, var, show=''):
+        tk.Label(parent, text=label, font=('Helvetica',9,'bold'),
+                 fg=C['subtext'], bg=C['panel']).pack(anchor='w', padx=12, pady=(8,2))
+        tk.Entry(parent, textvariable=var, font=('Helvetica',11), show=show,
+                 bg=C['card'], fg=C['text'], insertbackground=C['accent'],
+                 bd=0, relief='flat').pack(fill='x', padx=12, ipady=6)
+
+    def _build(self):
+        tk.Label(self.win, text="👤 Nouveau Compte", font=('Helvetica',18,'bold'),
+                 fg=C['accent'], bg=C['bg']).pack(pady=(20,4))
+        tk.Label(self.win, text="Votre demande sera transmise à l'administrateur",
+                 font=('Helvetica',9), fg=C['subtext'], bg=C['bg']).pack(pady=(0,16))
+
+        card = tk.Frame(self.win, bg=C['panel'], highlightthickness=1, highlightbackground=C['border'])
+        card.pack(fill='x', padx=24, pady=8, ipady=8)
+
+        self.v_user = tk.StringVar()
+        self.v_pwd1 = tk.StringVar()
+        self.v_pwd2 = tk.StringVar()
+        self.v_nom = tk.StringVar()
+        self.v_email = tk.StringVar()
+
+        self._field(card, "Identifiant souhaité *", self.v_user)
+        self._field(card, "Mot de passe *", self.v_pwd1, show='●')
+        self._field(card, "Confirmer mot de passe *", self.v_pwd2, show='●')
+        self._field(card, "Nom complet *", self.v_nom)
+        self._field(card, "Email", self.v_email)
+
+        self.err_lbl = tk.Label(self.win, text='', fg=C['red'], bg=C['bg'],
+                                 font=('Helvetica',9), wraplength=440)
+        self.err_lbl.pack(pady=(8,0))
+
+        btns = tk.Frame(self.win, bg=C['bg'])
+        btns.pack(pady=12)
+        tk.Button(btns, text="  Envoyer la demande  ", font=('Helvetica',11,'bold'),
+                  bg=C['green'], fg='white', bd=0, relief='flat', cursor='hand2',
+                  padx=16, pady=10, command=self._submit).pack(side='left', padx=8)
+        tk.Button(btns, text="Annuler", font=('Helvetica',10),
+                  bg=C['panel'], fg=C['subtext'], bd=0, relief='flat', cursor='hand2',
+                  padx=12, pady=10, command=self.win.destroy).pack(side='left', padx=8)
+
+    def _submit(self):
+        user = self.v_user.get().strip()
+        pwd1 = self.v_pwd1.get()
+        pwd2 = self.v_pwd2.get()
+        nom = self.v_nom.get().strip()
+        email = self.v_email.get().strip()
+
+        if not user or not pwd1 or not nom:
+            self.err_lbl.config(text="❌ Identifiant, mot de passe et nom complet sont obligatoires.")
+            return
+        if len(user) < 3:
+            self.err_lbl.config(text="❌ L'identifiant doit avoir au moins 3 caractères.")
+            return
+        if pwd1 != pwd2:
+            self.err_lbl.config(text="❌ Les mots de passe ne correspondent pas.")
+            return
+        if len(pwd1) < 6:
+            self.err_lbl.config(text="❌ Le mot de passe doit avoir au moins 6 caractères.")
+            return
+
+        # Créer le compte avec rôle lecteur par défaut (admin peut changer)
+        ok, msg = self.db.create_user(user, pwd1, nom, email, 'lecteur', 'TOUS', 'TOUS', 'TOUS')
+        if ok:
+            messagebox.showinfo("Compte créé",
+                f"✅ Compte '{user}' créé avec succès.\n\n"
+                "Rôle par défaut : Lecteur\n"
+                "Un administrateur devra définir votre périmètre géographique.",
+                parent=self.win)
+            self.win.destroy()
+        else:
+            self.err_lbl.config(text=f"❌ {msg}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  FENÊTRE CONNEXION v3
+# ═══════════════════════════════════════════════════════════════
+
+class LoginWindow:
+    def __init__(self, root, db):
+        self.root = root
+        self.db = db
+        self.root.title("RSH Épidémio v3 — Connexion")
+        self.root.geometry("500x660")
+        self.root.configure(bg=C['bg'])
+        self.root.resizable(False, False)
+        self._build()
+        self.root.update_idletasks()
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        x, y = (sw - 500)//2, (sh - 660)//2
+        self.root.geometry(f"500x660+{x}+{y}")
+
+    def _build(self):
+        f = tk.Frame(self.root, bg=C['bg'])
+        f.place(relx=0.5, rely=0.5, anchor='center')
+
+        # Logo & titre
+        tk.Label(f, text="🏥", font=('Segoe UI Emoji',52), bg=C['bg']).pack(pady=(0,4))
+        tk.Label(f, text="RSH ÉPIDÉMIO v3", font=('Helvetica',24,'bold'),
+                 fg=C['accent'], bg=C['bg']).pack()
+        tk.Label(f, text="Surveillance Multi-Districts — Madagascar",
+                 font=('Helvetica',10), fg=C['subtext'], bg=C['bg']).pack(pady=(2,4))
+        tk.Label(f, text=f"Version 3.0 — {datetime.now().year}",
+                 font=('Helvetica',8), fg=C['border'], bg=C['bg']).pack(pady=(0,16))
+
+        # Card connexion
+        card = tk.Frame(f, bg=C['panel'], highlightthickness=1, highlightbackground=C['border'])
+        card.pack(padx=16, pady=6, fill='x', ipadx=20, ipady=14)
+
+        tk.Label(card, text="Identifiant", font=('Helvetica',10,'bold'),
+                 fg=C['subtext'], bg=C['panel']).pack(anchor='w', padx=10, pady=(10,2))
+        self.user_var = tk.StringVar(value='admin')
+        tk.Entry(card, textvariable=self.user_var, font=('Helvetica',13),
+                 bg=C['card'], fg=C['text'], insertbackground=C['accent'],
+                 bd=0, relief='flat').pack(fill='x', padx=10, ipady=8)
+
+        tk.Label(card, text="Mot de passe", font=('Helvetica',10,'bold'),
+                 fg=C['subtext'], bg=C['panel']).pack(anchor='w', padx=10, pady=(12,2))
+        self.pwd_var = tk.StringVar(value='admin123')
+        tk.Entry(card, textvariable=self.pwd_var, show='●', font=('Helvetica',13),
+                 bg=C['card'], fg=C['text'], insertbackground=C['accent'],
+                 bd=0, relief='flat').pack(fill='x', padx=10, ipady=8)
+
+        self.err_lbl = tk.Label(f, text='', fg=C['red'], bg=C['bg'], font=('Helvetica',10))
+        self.err_lbl.pack(pady=(8,4))
+
+        # Bouton connexion
+        tk.Button(f, text="  SE CONNECTER  ", font=('Helvetica',13,'bold'),
+                  bg=C['accent'], fg='#000000', activebackground=C['accent2'],
+                  bd=0, relief='flat', cursor='hand2', command=self._login,
+                  padx=24, pady=12).pack(pady=4)
+
+        # Séparateur
+        sep = tk.Frame(f, bg=C['border'], height=1)
+        sep.pack(fill='x', padx=20, pady=(16,8))
+
+        # Bouton création de compte
+        tk.Button(f, text="➕  Créer un compte", font=('Helvetica',10),
+                  bg=C['panel'], fg=C['green'], activebackground=C['card'],
+                  bd=0, relief='flat', cursor='hand2',
+                  command=self._creer_compte, padx=16, pady=8,
+                  highlightthickness=1, highlightbackground=C['green']).pack(pady=4)
+
+        tk.Label(f, text="Compte par défaut : admin / admin123",
+                 font=('Helvetica',8), fg=C['border'], bg=C['bg']).pack(pady=(12,0))
+
+        self.root.bind('<Return>', lambda e: self._login())
+
+    def _login(self):
+        result = self.db.authenticate(self.user_var.get().strip(), self.pwd_var.get())
+        if result:
+            for widget in self.root.winfo_children():
+                widget.destroy()
+            self.root.title("RSH Épidémio v3 — Surveillance Multi-Districts — Madagascar")
+            self.root.geometry("1500x920")
+            self.root.resizable(True, True)
+            self.root.configure(bg=C['bg'])
+            self.root.minsize(1200, 750)
+            RSHApp(self.root, self.db, result['id'], result['role'],
+                   result['district'], result['region'])
+        else:
+            self.err_lbl.config(text="❌ Identifiant ou mot de passe incorrect")
+
+    def _creer_compte(self):
+        CreationCompteWindow(self.root, self.db)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  FENÊTRE ADMIN — GESTION UTILISATEURS
+# ═══════════════════════════════════════════════════════════════
+
+class AdminUsersWindow:
+    def __init__(self, parent, db: DatabaseManager, current_user_id):
+        self.db = db
+        self.current_user_id = current_user_id
+        self.win = tk.Toplevel(parent)
+        self.win.title("Administration — Gestion des utilisateurs")
+        self.win.configure(bg=C['bg'])
+        self.win.geometry("1100x700")
+        self.win.resizable(True, True)
+        self.win.transient(parent)
+        self._build()
+        self._load_users()
+        self.win.update_idletasks()
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        x, y = (sw - 1100)//2, (sh - 700)//2
+        self.win.geometry(f"1100x700+{x}+{y}")
+
+    def _build(self):
+        # Titre
+        hdr = tk.Frame(self.win, bg=C['panel'], height=54)
+        hdr.pack(fill='x'); hdr.pack_propagate(False)
+        tk.Label(hdr, text="👥 Administration — Gestion des utilisateurs",
+                 font=('Helvetica',14,'bold'), fg=C['accent'], bg=C['panel']).pack(side='left', padx=18, pady=14)
+        tk.Button(hdr, text="➕ Nouvel utilisateur", font=('Helvetica',10,'bold'),
+                  bg=C['green'], fg='white', bd=0, relief='flat', cursor='hand2',
+                  padx=12, pady=6, command=self._new_user).pack(side='right', padx=12, pady=10)
+        tk.Button(hdr, text="🔄 Actualiser", font=('Helvetica',10),
+                  bg=C['panel'], fg=C['accent'], bd=0, relief='flat', cursor='hand2',
+                  padx=10, pady=6, command=self._load_users).pack(side='right', padx=4, pady=10)
+
+        # Tableau
+        main = tk.Frame(self.win, bg=C['bg'])
+        main.pack(fill='both', expand=True, padx=16, pady=10)
+
+        tbl_f = tk.Frame(main, bg=C['panel'], highlightthickness=1, highlightbackground=C['border'])
+        tbl_f.pack(fill='both', expand=True)
+
+        cols = ('ID', 'Identifiant', 'Nom complet', 'Email', 'Rôle', 'Périmètre',
+                'Région', 'District', 'Actif', 'Connexion', 'Créé le')
+        self.tree = ttk.Treeview(tbl_f, columns=cols, show='headings', height=22)
+        widths = [40, 110, 180, 180, 100, 80, 100, 120, 50, 140, 120]
+        for col, w in zip(cols, widths):
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=w, minwidth=40)
+
+        style = ttk.Style()
+        style.configure('Admin.Treeview', background=C['card'], foreground=C['text'],
+                        fieldbackground=C['card'], rowheight=26, font=('Helvetica',9))
+        style.configure('Admin.Treeview.Heading', background=C['panel'], foreground=C['accent'],
+                        font=('Helvetica',9,'bold'))
+        self.tree.configure(style='Admin.Treeview')
+        self.tree.tag_configure('admin', foreground=C['red'])
+        self.tree.tag_configure('inactif', foreground=C['border'])
+
+        sb_y = ttk.Scrollbar(tbl_f, orient='vertical', command=self.tree.yview)
+        sb_x = ttk.Scrollbar(tbl_f, orient='horizontal', command=self.tree.xview)
+        self.tree.configure(yscrollcommand=sb_y.set, xscrollcommand=sb_x.set)
+        self.tree.pack(side='left', fill='both', expand=True, padx=8, pady=8)
+        sb_y.pack(side='right', fill='y', pady=8)
+
+        # Boutons actions
+        actions = tk.Frame(self.win, bg=C['panel'], height=52)
+        actions.pack(fill='x'); actions.pack_propagate(False)
+        for txt, cmd, fg in [
+            ("✏️ Modifier", self._edit_user, C['accent']),
+            ("🔑 Réinit. MDP", self._reset_pwd, C['yellow']),
+            ("🚫 Désactiver", self._deactivate_user, C['red']),
+            ("✅ Activer", self._activate_user, C['green']),
+        ]:
+            tk.Button(actions, text=txt, font=('Helvetica',10), bg=C['card'], fg=fg,
+                      bd=0, relief='flat', cursor='hand2', padx=12, pady=6,
+                      command=cmd).pack(side='left', padx=8, pady=8)
+
+    def _load_users(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        df = self.db.get_all_users()
+        for _, row in df.iterrows():
+            actif = "✅" if row['actif'] else "❌"
+            last = str(row.get('last_login', ''))[:16] if row.get('last_login') else '—'
+            created = str(row.get('created_at', ''))[:16]
+            tag = 'admin' if row['role'] == 'admin' else ('inactif' if not row['actif'] else '')
+            self.tree.insert('', 'end', values=(
+                row['id'], row['username'], row['nom_complet'], row['email'],
+                ROLES.get(row['role'], row['role']), row['perimetre'],
+                row['region'], row['district'], actif, last, created
+            ), tags=(tag,))
+
+    def _get_selected_id(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Veuillez sélectionner un utilisateur.", parent=self.win)
+            return None
+        return int(self.tree.item(sel[0])['values'][0])
+
+    def _new_user(self):
+        EditUserDialog(self.win, self.db, None, self.current_user_id, self._load_users)
+
+    def _edit_user(self):
+        uid = self._get_selected_id()
+        if uid:
+            EditUserDialog(self.win, self.db, uid, self.current_user_id, self._load_users)
+
+    def _reset_pwd(self):
+        uid = self._get_selected_id()
+        if uid is None: return
+        new_pwd = simpledialog.askstring("Réinitialiser MDP",
+            "Nouveau mot de passe (min. 6 caractères) :", parent=self.win, show='●')
+        if not new_pwd: return
+        if len(new_pwd) < 6:
+            messagebox.showerror("Erreur", "Mot de passe trop court (minimum 6 caractères).", parent=self.win)
+            return
+        ok, msg = self.db.reset_password(uid, new_pwd)
+        messagebox.showinfo("Résultat", msg, parent=self.win)
+
+    def _deactivate_user(self):
+        uid = self._get_selected_id()
+        if uid is None: return
+        if uid == self.current_user_id:
+            messagebox.showerror("Erreur", "Vous ne pouvez pas désactiver votre propre compte.", parent=self.win)
+            return
+        if messagebox.askyesno("Confirmer", "Désactiver cet utilisateur ?", parent=self.win):
+            ok, msg = self.db.delete_user(uid)
+            messagebox.showinfo("Résultat", msg, parent=self.win)
+            self._load_users()
+
+    def _activate_user(self):
+        uid = self._get_selected_id()
+        if uid is None: return
+        conn = self.db._conn()
+        conn.execute("UPDATE users SET actif=1 WHERE id=?", (uid,))
+        conn.commit()
+        conn.close()
+        self._load_users()
+
+
+class EditUserDialog:
+    """Formulaire création/modification utilisateur."""
+    def __init__(self, parent, db, user_id, current_user_id, on_save):
+        self.db = db
+        self.user_id = user_id
+        self.current_user_id = current_user_id
+        self.on_save = on_save
+        self.win = tk.Toplevel(parent)
+        self.win.title("Nouvel utilisateur" if user_id is None else "Modifier utilisateur")
+        self.win.configure(bg=C['bg'])
+        self.win.geometry("520x680")
+        self.win.resizable(False, False)
+        self.win.transient(parent)
+        self.win.grab_set()
+        self._vars = {}
+        self._build()
+        if user_id:
+            self._load_user(user_id)
+        self.win.update_idletasks()
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        self.win.geometry(f"520x680+{(sw-520)//2}+{(sh-680)//2}")
+
+    def _field(self, parent, label, key, show=''):
+        tk.Label(parent, text=label, font=('Helvetica',9,'bold'),
+                 fg=C['subtext'], bg=C['panel']).pack(anchor='w', padx=12, pady=(8,2))
+        var = tk.StringVar()
+        self._vars[key] = var
+        tk.Entry(parent, textvariable=var, font=('Helvetica',11), show=show,
+                 bg=C['card'], fg=C['text'], insertbackground=C['accent'],
+                 bd=0, relief='flat').pack(fill='x', padx=12, ipady=6)
+        return var
+
+    def _combo(self, parent, label, key, values):
+        tk.Label(parent, text=label, font=('Helvetica',9,'bold'),
+                 fg=C['subtext'], bg=C['panel']).pack(anchor='w', padx=12, pady=(8,2))
+        var = tk.StringVar()
+        self._vars[key] = var
+        cb = ttk.Combobox(parent, textvariable=var, values=values,
+                          state='readonly', font=('Helvetica',11))
+        cb.pack(fill='x', padx=12, ipady=4)
+        return var
+
+    def _build(self):
+        tk.Label(self.win, text="👤 Utilisateur",
+                 font=('Helvetica',16,'bold'), fg=C['accent'], bg=C['bg']).pack(pady=(16,12))
+
+        card = tk.Frame(self.win, bg=C['panel'], highlightthickness=1, highlightbackground=C['border'])
+        card.pack(fill='x', padx=20, pady=4, ipady=8)
+
+        self._field(card, "Identifiant *", 'username')
+        if self.user_id is None:
+            self._field(card, "Mot de passe *", 'password', show='●')
+        self._field(card, "Nom complet *", 'nom_complet')
+        self._field(card, "Email", 'email')
+
+        role_vals = list(ROLES.keys())
+        self._combo(card, "Rôle *", 'role', role_vals)
+        self._vars['role'].set('lecteur')
+
+        peri_vals = ['TOUS', 'REGION', 'DISTRICT']
+        self._combo(card, "Périmètre *", 'perimetre', peri_vals)
+        self._vars['perimetre'].set('TOUS')
+
+        self._field(card, "Région (ou TOUS)", 'region')
+        self._vars['region'].set('TOUS')
+        self._field(card, "District (ou TOUS)", 'district')
+        self._vars['district'].set('TOUS')
+
+        # Actif
+        self._vars['actif'] = tk.IntVar(value=1)
+        tk.Checkbutton(card, text="Compte actif", variable=self._vars['actif'],
+                       font=('Helvetica',10), fg=C['text'], bg=C['panel'],
+                       selectcolor=C['card'], activebackground=C['panel']).pack(anchor='w', padx=12, pady=(10,4))
+
+        self.err_lbl = tk.Label(self.win, text='', fg=C['red'], bg=C['bg'],
+                                 font=('Helvetica',9), wraplength=460)
+        self.err_lbl.pack(pady=4)
+
+        btns = tk.Frame(self.win, bg=C['bg'])
+        btns.pack(pady=10)
+        tk.Button(btns, text="  Enregistrer  ", font=('Helvetica',11,'bold'),
+                  bg=C['accent'], fg='black', bd=0, relief='flat', cursor='hand2',
+                  padx=16, pady=10, command=self._save).pack(side='left', padx=8)
+        tk.Button(btns, text="Annuler", font=('Helvetica',10),
+                  bg=C['panel'], fg=C['subtext'], bd=0, relief='flat', cursor='hand2',
+                  padx=12, pady=10, command=self.win.destroy).pack(side='left', padx=8)
+
+    def _load_user(self, user_id):
+        conn = self.db._conn()
+        row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        conn.close()
+        if not row: return
+        self._vars['username'].set(row['username'])
+        self._vars['nom_complet'].set(row['nom_complet'] or '')
+        self._vars['email'].set(row['email'] or '')
+        self._vars['role'].set(row['role'])
+        self._vars['perimetre'].set(row['perimetre'])
+        self._vars['region'].set(row['region'])
+        self._vars['district'].set(row['district'])
+        self._vars['actif'].set(row['actif'])
+
+    def _save(self):
+        username = self._vars['username'].get().strip()
+        nom = self._vars['nom_complet'].get().strip()
+        email = self._vars['email'].get().strip()
+        role = self._vars['role'].get()
+        perimetre = self._vars['perimetre'].get()
+        region = self._vars['region'].get().strip() or 'TOUS'
+        district = self._vars['district'].get().strip() or 'TOUS'
+        actif = self._vars['actif'].get()
+
+        if not username or not nom or not role:
+            self.err_lbl.config(text="❌ Identifiant, nom complet et rôle sont obligatoires.")
+            return
+
+        if self.user_id is None:
+            pwd = self._vars.get('password', tk.StringVar()).get()
+            if not pwd or len(pwd) < 6:
+                self.err_lbl.config(text="❌ Mot de passe obligatoire (minimum 6 caractères).")
+                return
+            ok, msg = self.db.create_user(username, pwd, nom, email, role, perimetre, region, district,
+                                           self.current_user_id)
+        else:
+            ok, msg = self.db.update_user(self.user_id, nom, email, role, perimetre, region, district, actif)
+
+        if ok:
+            messagebox.showinfo("Succès", msg, parent=self.win)
+            self.on_save()
+            self.win.destroy()
+        else:
+            self.err_lbl.config(text=f"❌ {msg}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  FENÊTRE IMPORT RÉSEAU URL
+# ═══════════════════════════════════════════════════════════════
+
+class ImportURLWindow:
+    def __init__(self, parent, db: DatabaseManager, annee_var, on_success):
+        self.db = db
+        self.annee_var = annee_var
+        self.on_success = on_success
+        self.win = tk.Toplevel(parent)
+        self.win.title("Import Excel via URL réseau")
+        self.win.configure(bg=C['bg'])
+        self.win.geometry("680x560")
+        self.win.resizable(False, False)
+        self.win.transient(parent)
+        self.win.grab_set()
+        self._build()
+        self._load_sources()
+        self.win.update_idletasks()
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        self.win.geometry(f"680x560+{(sw-680)//2}+{(sh-560)//2}")
+
+    def _build(self):
+        tk.Label(self.win, text="🌐 Import via URL réseau",
+                 font=('Helvetica',16,'bold'), fg=C['accent'], bg=C['bg']).pack(pady=(18,4))
+        tk.Label(self.win, text="Importez un fichier Excel RSH directement depuis un lien réseau ou serveur partagé",
+                 font=('Helvetica',9), fg=C['subtext'], bg=C['bg']).pack(pady=(0,14))
+
+        # Nouvelle URL
+        card1 = tk.Frame(self.win, bg=C['panel'], highlightthickness=1, highlightbackground=C['border'])
+        card1.pack(fill='x', padx=20, pady=(0,10), ipady=10)
+        tk.Label(card1, text="URL du fichier Excel", font=('Helvetica',10,'bold'),
+                 fg=C['subtext'], bg=C['panel']).pack(anchor='w', padx=12, pady=(10,2))
+
+        url_row = tk.Frame(card1, bg=C['panel'])
+        url_row.pack(fill='x', padx=12)
+        self.url_var = tk.StringVar()
+        tk.Entry(url_row, textvariable=self.url_var, font=('Helvetica',10),
+                 bg=C['card'], fg=C['text'], insertbackground=C['accent'],
+                 bd=0, relief='flat').pack(side='left', fill='x', expand=True, ipady=6)
+        tk.Button(url_row, text="📥 Importer", font=('Helvetica',10,'bold'),
+                  bg=C['accent'], fg='black', bd=0, relief='flat', cursor='hand2',
+                  padx=10, pady=6, command=self._import_url).pack(side='left', padx=(8,0))
+
+        # Sauvegarder comme source
+        save_row = tk.Frame(card1, bg=C['panel'])
+        save_row.pack(fill='x', padx=12, pady=(8,4))
+        tk.Label(save_row, text="Nom (pour sauvegarder) :", font=('Helvetica',9),
+                 fg=C['subtext'], bg=C['panel']).pack(side='left')
+        self.nom_source_var = tk.StringVar()
+        tk.Entry(save_row, textvariable=self.nom_source_var, font=('Helvetica',10),
+                 bg=C['card'], fg=C['text'], insertbackground=C['accent'],
+                 bd=0, relief='flat', width=24).pack(side='left', padx=8, ipady=4)
+        tk.Button(save_row, text="💾 Sauvegarder source", font=('Helvetica',9),
+                  bg=C['panel'], fg=C['teal'], bd=0, relief='flat', cursor='hand2',
+                  padx=8, pady=4, command=self._save_source).pack(side='left', padx=4)
+
+        # Sources sauvegardées
+        card2 = tk.Frame(self.win, bg=C['panel'], highlightthickness=1, highlightbackground=C['border'])
+        card2.pack(fill='both', expand=True, padx=20, pady=(0,10))
+        tk.Label(card2, text="Sources enregistrées", font=('Helvetica',10,'bold'),
+                 fg=C['subtext'], bg=C['panel']).pack(anchor='w', padx=12, pady=(10,4))
+
+        cols = ('ID', 'Nom', 'URL', 'District', 'Région', 'Type')
+        self.src_tree = ttk.Treeview(card2, columns=cols, show='headings', height=6)
+        widths = [40, 160, 260, 100, 100, 70]
+        for col, w in zip(cols, widths):
+            self.src_tree.heading(col, text=col)
+            self.src_tree.column(col, width=w)
+        style = ttk.Style()
+        style.configure('Src.Treeview', background=C['card'], foreground=C['text'],
+                        fieldbackground=C['card'], rowheight=24, font=('Helvetica',9))
+        self.src_tree.configure(style='Src.Treeview')
+        self.src_tree.pack(fill='both', expand=True, padx=8, pady=4)
+
+        btns = tk.Frame(card2, bg=C['panel'])
+        btns.pack(fill='x', padx=8, pady=4)
+        tk.Button(btns, text="▶ Importer sélection", font=('Helvetica',9,'bold'),
+                  bg=C['green'], fg='white', bd=0, relief='flat', cursor='hand2',
+                  padx=10, pady=4, command=self._import_selected_source).pack(side='left', padx=4)
+        tk.Button(btns, text="🗑 Supprimer", font=('Helvetica',9),
+                  bg=C['panel'], fg=C['red'], bd=0, relief='flat', cursor='hand2',
+                  padx=8, pady=4, command=self._delete_source).pack(side='left', padx=4)
+
+        # Barre progression
+        self.prog_lbl = tk.Label(self.win, text='', fg=C['text'], bg=C['bg'], font=('Helvetica',9))
+        self.prog_lbl.pack()
+        style.configure('URL.Horizontal.TProgressbar', troughcolor=C['card'],
+                        background=C['accent'], thickness=14)
+        self.pbar = ttk.Progressbar(self.win, length=640, mode='determinate',
+                                     style='URL.Horizontal.TProgressbar')
+        self.pbar.pack(padx=20, pady=(4,14))
+
+    def _load_sources(self):
+        for item in self.src_tree.get_children():
+            self.src_tree.delete(item)
+        df = self.db.get_sources()
+        for _, row in df.iterrows():
+            if row.get('actif', 1):
+                self.src_tree.insert('', 'end', values=(
+                    row['id'], row['nom'], row['url'][:60] if row['url'] else '',
+                    row['district'] or '', row['region'] or '', row['type_source']))
+
+    def _save_source(self):
+        url = self.url_var.get().strip()
+        nom = self.nom_source_var.get().strip()
+        if not url or not nom:
+            messagebox.showwarning("Incomplet", "URL et nom sont requis.", parent=self.win)
+            return
+        ok, msg = self.db.add_source(nom, 'url', url, 'TOUS', 'TOUS')
+        if ok:
+            self._load_sources()
+        else:
+            messagebox.showerror("Erreur", msg, parent=self.win)
+
+    def _delete_source(self):
+        sel = self.src_tree.selection()
+        if not sel: return
+        sid = int(self.src_tree.item(sel[0])['values'][0])
+        self.db.delete_source(sid)
+        self._load_sources()
+
+    def _import_url(self):
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showwarning("URL manquante", "Veuillez saisir une URL.", parent=self.win)
+            return
+        annee = self.annee_var.get() if hasattr(self.annee_var, 'get') else ANNEE_COURANTE
+        self._do_import_url(url, annee)
+
+    def _import_selected_source(self):
+        sel = self.src_tree.selection()
+        if not sel:
+            messagebox.showwarning("Sélection", "Sélectionnez une source.", parent=self.win)
+            return
+        url = self.src_tree.item(sel[0])['values'][2]
+        annee = self.annee_var.get() if hasattr(self.annee_var, 'get') else ANNEE_COURANTE
+        self._do_import_url(url, annee)
+
+    def _do_import_url(self, url, annee):
+        def update_ui(msg, pct):
+            try:
+                self.win.after(0, lambda: self.prog_lbl.config(text=msg))
+                self.win.after(0, lambda: self.pbar.configure(value=pct))
+            except Exception:
+                pass
+
+        def run():
+            imp = ImportateurRSH(self.db, annee, update_ui)
+            ok, result, district = imp.importer_depuis_url(url)
+            def done():
+                if ok:
+                    messagebox.showinfo("Import réussi",
+                        f"✅ {result} enregistrements importés\nDistrict : {district}",
+                        parent=self.win)
+                    self.on_success()
+                    self.win.destroy()
+                else:
+                    messagebox.showerror("Erreur", f"❌ {result}", parent=self.win)
+            self.win.after(500, done)
+
+        threading.Thread(target=run, daemon=True).start()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  APPLICATION PRINCIPALE v3
+# ═══════════════════════════════════════════════════════════════
+
+class RSHApp:
+    def __init__(self, root, db, user_id, role, user_district='TOUS', user_region='TOUS'):
+        self.root = root
+        self.db = db
+        self.user_id = user_id
+        self.role = role
+        self.user_district = user_district
+        self.user_region = user_region
+
+        # Filtres actifs
+        self.annee_var = tk.IntVar(value=ANNEE_COURANTE)
+        self.district_filtre = tk.StringVar(value=user_district)
+        self.semaine_courante = tk.StringVar(value='S1')
+
+        self.root.title("RSH Épidémio v3 — Surveillance Multi-Districts — Madagascar")
+        self.root.geometry("1500x920")
+        self.root.configure(bg=C['bg'])
+        self.root.minsize(1200, 750)
+
+        self._build_ui()
+        self._refresh_filtres()
+        self._load_dashboard()
+
+    def can(self, action):
+        """Contrôle d'accès simple."""
+        if self.role == 'admin': return True
+        if action == 'import' and self.role in ('national', 'region', 'district'): return True
+        if action == 'admin_users': return self.role == 'admin'
+        if action == 'view': return True
+        return self.role != 'lecteur'
+
+    def _build_ui(self):
+        # Header
+        header = tk.Frame(self.root, bg=C['panel'], height=64)
+        header.pack(fill='x')
+        header.pack_propagate(False)
+
+        tk.Label(header, text="🦟 RSH ÉPIDÉMIO v3", font=('Helvetica',15,'bold'),
+                 fg=C['accent'], bg=C['panel']).pack(side='left', padx=18, pady=14)
+        tk.Label(header, text="Surveillance Multi-Districts · Madagascar",
+                 font=('Helvetica',10), fg=C['subtext'], bg=C['panel']).pack(side='left', pady=16)
+
+        # Contrôles filtres (droite)
+        tk.Button(header, text="🚪", font=('Helvetica',12), bg=C['panel'], fg=C['subtext'],
+                  bd=0, relief='flat', cursor='hand2', command=self._logout).pack(side='right', padx=6, pady=14)
+
+        if self.role == 'admin':
+            tk.Button(header, text="👥 Admin utilisateurs", font=('Helvetica',9,'bold'),
+                      bg=C['purple'], fg='white', bd=0, relief='flat', cursor='hand2',
+                      command=self._open_admin_users, padx=10, pady=6).pack(side='right', padx=4, pady=14)
+
+        # Import Excel
+        if self.can('import'):
+            tk.Button(header, text="🌐 Import URL", font=('Helvetica',9,'bold'),
+                      bg=C['teal'], fg='black', bd=0, relief='flat', cursor='hand2',
+                      command=self._import_url, padx=10, pady=6).pack(side='right', padx=4, pady=14)
+            tk.Button(header, text="📥 Import Fichier", font=('Helvetica',9,'bold'),
+                      bg=C['green'], fg='white', bd=0, relief='flat', cursor='hand2',
+                      command=self._import_excel, padx=10, pady=6).pack(side='right', padx=4, pady=14)
+
+        # Semaine
+        tk.Label(header, text="Semaine :", fg=C['subtext'], bg=C['panel'],
+                 font=('Helvetica',10)).pack(side='right', padx=(0,4), pady=14)
+        self.sem_combo = ttk.Combobox(header, textvariable=self.semaine_courante,
+                                       width=8, state='readonly', font=('Helvetica',11))
+        self.sem_combo.pack(side='right', padx=(0,6), pady=12)
+        self.sem_combo.bind('<<ComboboxSelected>>', lambda e: self._on_semaine_change())
+
+        # Année
+        tk.Label(header, text="Année :", fg=C['subtext'], bg=C['panel'],
+                 font=('Helvetica',10)).pack(side='right', padx=(0,4), pady=14)
+        self.annee_combo = ttk.Combobox(header, textvariable=self.annee_var,
+                                         width=7, state='readonly', font=('Helvetica',11))
+        self.annee_combo.pack(side='right', padx=(0,6), pady=12)
+        self.annee_combo.bind('<<ComboboxSelected>>', lambda e: self._on_annee_change())
+
+        # District
+        tk.Label(header, text="District :", fg=C['subtext'], bg=C['panel'],
+                 font=('Helvetica',10)).pack(side='right', padx=(0,4), pady=14)
+        self.district_combo = ttk.Combobox(header, textvariable=self.district_filtre,
+                                            width=18, state='readonly', font=('Helvetica',11))
+        self.district_combo.pack(side='right', padx=(0,6), pady=12)
+        self.district_combo.bind('<<ComboboxSelected>>', lambda e: self._on_district_change())
+
+        # Notebook
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('RSH.TNotebook', background=C['bg'], borderwidth=0)
+        style.configure('RSH.TNotebook.Tab', background=C['panel'], foreground=C['subtext'],
+                        padding=[14,8], font=('Helvetica',10,'bold'), borderwidth=0)
+        style.map('RSH.TNotebook.Tab', background=[('selected', C['card'])],
+                  foreground=[('selected', C['accent'])])
+
+        self.notebook = ttk.Notebook(self.root, style='RSH.TNotebook')
+        self.notebook.pack(fill='both', expand=True)
+
+        tabs = [
+            ('tab_dashboard',   '📊 Tableau de bord'),
+            ('tab_compilation', '🗺️ Multi-Districts'),
+            ('tab_annees',      '📅 Comparaison Années'),
+            ('tab_maladies',    '🦠 Maladies'),
+            ('tab_paludisme',   '🦟 Paludisme'),
+            ('tab_alertes',     '🚨 Alertes'),
+            ('tab_evenements',  '⚡ Événements'),
+            ('tab_completude',  '✅ Complétude'),
+            ('tab_seuils',      '⚙️ Seuils'),
+            ('tab_imports',     '📋 Imports'),
+        ]
+        for attr, label in tabs:
+            frame = tk.Frame(self.notebook, bg=C['bg'])
+            setattr(self, attr, frame)
+            self.notebook.add(frame, text=label)
+
+        self.notebook.bind('<<NotebookTabChanged>>', self._on_tab_change)
+
+        self._build_dashboard()
+        self._build_compilation()
+        self._build_annees()
+        self._build_maladies()
+        self._build_paludisme()
+        self._build_alertes()
+        self._build_evenements()
+        self._build_completude()
+        self._build_seuils()
+        self._build_imports()
+
+        # Status bar
+        self.status_bar = tk.Label(self.root,
+            text=f"Connecté : {'Admin' if self.role=='admin' else self.role.title()} — "
+                 f"Périmètre : {self.user_district} — RSH Épidémio v3",
+            font=('Helvetica',9), fg=C['subtext'], bg=C['panel'], anchor='w', padx=12)
+        self.status_bar.pack(fill='x', side='bottom')
+
+    # ─────────────────────────────────────────────────────────────
+    # DASHBOARD
+    # ─────────────────────────────────────────────────────────────
+
+    def _build_dashboard(self):
+        f = self.tab_dashboard
+        self.kpi_frame = tk.Frame(f, bg=C['bg'])
+        self.kpi_frame.pack(fill='x', padx=16, pady=(14,8))
+        charts_row = tk.Frame(f, bg=C['bg'])
+        charts_row.pack(fill='both', expand=True, padx=16, pady=(0,12))
+        self.dash_left = tk.Frame(charts_row, bg=C['panel'], bd=0,
+                                   highlightthickness=1, highlightbackground=C['border'])
+        self.dash_left.pack(side='left', fill='both', expand=True, padx=(0,8))
+        self.dash_right = tk.Frame(charts_row, bg=C['panel'], bd=0,
+                                    highlightthickness=1, highlightbackground=C['border'])
+        self.dash_right.pack(side='right', fill='both', expand=True)
+
+    def _load_dashboard(self):
+        annee = self.annee_var.get()
+        dist = self.district_filtre.get()
+        stats = self.db.get_stats_generales(annee, dist if dist != 'TOUS' else None)
+        for w in self.kpi_frame.winfo_children(): w.destroy()
+        kpis = [
+            ("🗺️", "Districts",     str(stats['nb_districts']),      C['purple']),
+            ("🏥", "Consultations",  f"{stats['total_consultations']:,}".replace(',', ' '), C['accent']),
+            ("📅", "Semaines",       str(stats['nb_semaines']),       C['accent2']),
+            ("🏨", "CSB actifs",     str(stats['nb_csb']),            C['green']),
+            ("🟡", "Alertes",        str(stats['nb_alertes']),        C['yellow']),
+            ("🔴", "Épidémies",      str(stats['nb_alertes_epidemie']), C['red']),
+        ]
+        for icon, label, val, color in kpis:
+            card = tk.Frame(self.kpi_frame, bg=C['panel'], bd=0,
+                            highlightthickness=1, highlightbackground=color)
+            card.pack(side='left', fill='both', expand=True, padx=5, ipady=10)
+            tk.Label(card, text=icon, font=('Segoe UI Emoji',22), bg=C['panel']).pack(pady=(8,0))
+            tk.Label(card, text=val, font=('Helvetica',18,'bold'), fg=color, bg=C['panel']).pack()
+            tk.Label(card, text=label, font=('Helvetica',9), fg=C['subtext'], bg=C['panel']).pack(pady=(0,8))
+        self._plot_top_maladies_dash()
+        self._plot_tableau_districts_dash()
+
+    def _plot_top_maladies_dash(self):
+        for w in self.dash_left.winfo_children(): w.destroy()
+        annee = self.annee_var.get()
+        sem = self.semaine_courante.get()
+        dist = self.district_filtre.get()
+        titre = f"Top maladies — {sem} {annee} — {'Tous districts' if dist == 'TOUS' else dist}"
+        tk.Label(self.dash_left, text=titre, font=('Helvetica',11,'bold'),
+                 fg=C['accent'], bg=C['panel']).pack(pady=(10,4))
+        if dist == 'TOUS':
+            df = self.db.get_top_maladies_tous_districts(sem, annee)
+        else:
+            df = self.db.get_resume_district_semaine(sem, annee, dist)
+        df = df[df.get('total_cas', df.get('total_cas', pd.Series(dtype=int))) if 'total_cas' in df.columns else df['total_cas'] > 0]
+        if 'total_cas' in df.columns:
+            df = df[df['total_cas'] > 0].head(12)
+        fig, ax = plt.subplots(figsize=(6.5, 4.2))
+        fig.patch.set_facecolor(C['panel']); ax.set_facecolor(C['card'])
+        if not df.empty and 'total_cas' in df.columns:
+            noms = [m[:32] + '…' if len(m) > 32 else m for m in df['maladie']]
+            vals = df['total_cas'].values
+            colors = [C['red'] if v == vals.max() else C['accent'] for v in vals]
+            bars = ax.barh(range(len(noms)), vals[::-1], color=colors[::-1], edgecolor='none', height=0.6)
+            ax.set_yticks(range(len(noms)))
+            ax.set_yticklabels(noms[::-1], fontsize=8, color=C['text'])
+            for bar, v in zip(bars, vals[::-1]):
+                ax.text(bar.get_width()+0.3, bar.get_y()+bar.get_height()/2,
+                        str(int(v)), va='center', fontsize=8, color=C['text'])
+        else:
+            ax.text(0.5, 0.5, 'Aucune donnée\nImportez un fichier RSH', ha='center', va='center',
+                    color=C['subtext'], fontsize=11, transform=ax.transAxes)
+        ax.set_xlabel('Nombre de cas', color=C['subtext'], fontsize=8)
+        ax.tick_params(colors=C['subtext']); ax.spines[:].set_color(C['border'])
+        plt.tight_layout(pad=0.5)
+        cv = FigureCanvasTkAgg(fig, self.dash_left)
+        cv.draw(); cv.get_tk_widget().pack(fill='both', expand=True, padx=6, pady=(0,8))
+        plt.close(fig)
+
+    def _plot_tableau_districts_dash(self):
+        for w in self.dash_right.winfo_children(): w.destroy()
+        annee = self.annee_var.get()
+        sem = self.semaine_courante.get()
+        tk.Label(self.dash_right, text=f"Vue districts — {sem} {annee}",
+                 font=('Helvetica',11,'bold'), fg=C['accent'], bg=C['panel']).pack(pady=(10,4))
+        df = self.db.get_tableau_bord_districts(sem, annee)
+        fig, ax = plt.subplots(figsize=(6.5, 4.2))
+        fig.patch.set_facecolor(C['panel']); ax.set_facecolor(C['card'])
+        if not df.empty:
+            districts = df['district'].tolist()
+            x = np.arange(len(districts)); w_bar = 0.28
+            ax.bar(x - w_bar, df['consultations']/10, w_bar, label='Consult./10', color=C['accent'], alpha=0.85)
+            ax.bar(x, df['palu'], w_bar, label='Paludisme', color=C['red'], alpha=0.85)
+            ax.bar(x + w_bar, df['ira'], w_bar, label='IRA', color=C['yellow'], alpha=0.85)
+            ax.set_xticks(x)
+            ax.set_xticklabels([d[:12] for d in districts], rotation=30, ha='right', fontsize=8, color=C['text'])
+            ax.legend(fontsize=7, facecolor=C['card'], edgecolor=C['border'], labelcolor=C['text'])
+        else:
+            ax.text(0.5, 0.5, 'Aucune donnée\nImportez des fichiers RSH', ha='center', va='center',
+                    color=C['subtext'], fontsize=11, transform=ax.transAxes)
+        ax.tick_params(colors=C['subtext']); ax.spines[:].set_color(C['border'])
+        ax.grid(True, alpha=0.12, color=C['border'], axis='y')
+        plt.tight_layout(pad=0.5)
+        cv = FigureCanvasTkAgg(fig, self.dash_right)
+        cv.draw(); cv.get_tk_widget().pack(fill='both', expand=True, padx=6, pady=(0,8))
+        plt.close(fig)
+
+    # ─────────────────────────────────────────────────────────────
+    # COMPILATION MULTI-DISTRICTS
+    # ─────────────────────────────────────────────────────────────
+
+    def _build_compilation(self):
+        f = self.tab_compilation
+        ctrl = tk.Frame(f, bg=C['panel'], height=56)
+        ctrl.pack(fill='x'); ctrl.pack_propagate(False)
+        tk.Label(ctrl, text="Maladie :", fg=C['subtext'], bg=C['panel'],
+                 font=('Helvetica',10)).pack(side='left', padx=(16,4), pady=16)
+        self.comp_maladie_var = tk.StringVar()
+        self.comp_maladie_combo = ttk.Combobox(ctrl, textvariable=self.comp_maladie_var,
+                                                width=44, state='readonly', font=('Helvetica',10))
+        self.comp_maladie_combo.pack(side='left', padx=4, pady=14)
+        tk.Button(ctrl, text="📊 Compiler & Analyser", font=('Helvetica',10,'bold'),
+                  bg=C['accent'], fg='black', bd=0, relief='flat', cursor='hand2',
+                  padx=14, pady=6, command=self._plot_compilation).pack(side='left', padx=12, pady=12)
+        tk.Button(ctrl, text="📋 Tableau synthèse", font=('Helvetica',10),
+                  bg=C['panel'], fg=C['teal'], bd=0, relief='flat', cursor='hand2',
+                  padx=10, pady=6, command=self._afficher_tableau_synthese).pack(side='left', padx=4, pady=12)
+        self.comp_container = tk.Frame(f, bg=C['bg'])
+        self.comp_container.pack(fill='both', expand=True)
+
+    def _plot_compilation(self):
+        for w in self.comp_container.winfo_children(): w.destroy()
+        maladie = self.comp_maladie_var.get()
+        annee = self.annee_var.get()
+        if not maladie: return
+        df = self.db.get_comparaison_districts(maladie, annee)
+        if df.empty:
+            tk.Label(self.comp_container, text="Aucune donnée multi-districts disponible.",
+                     fg=C['subtext'], bg=C['bg'], font=('Helvetica',12)).pack(expand=True)
+            return
+        districts = df['district'].unique()
+        n_dist = len(districts)
+        fig = plt.figure(figsize=(15, 8))
+        fig.patch.set_facecolor(C['bg'])
+        fig.suptitle(f"Analyse multi-districts : {maladie} — {annee}",
+                     color=C['accent'], fontsize=13, fontweight='bold')
+        gs = GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.3, height_ratios=[1.2, 0.8])
+        ax_main = fig.add_subplot(gs[0, :])
+        ax_bar = fig.add_subplot(gs[1, 0])
+        ax_heat = fig.add_subplot(gs[1, 1])
+        for ax in [ax_main, ax_bar, ax_heat]:
+            ax.set_facecolor(C['card']); ax.tick_params(colors=C['subtext'], labelsize=8)
+            ax.spines[:].set_color(C['border'])
+        ax_main.set_title("Évolution hebdomadaire par district", color=C['text'], fontsize=11)
+        color_map = {d: DISTRICT_COLORS[i % len(DISTRICT_COLORS)] for i, d in enumerate(districts)}
+        for district in districts:
+            dfd = df[df['district'] == district]
+            x = [int(s[1:]) for s in dfd['semaine']]
+            ax_main.plot(x, dfd['cas'], color=color_map[district], linewidth=2, marker='o',
+                         markersize=4, label=district, alpha=0.9)
+        ax_main.set_xlabel('Semaine épidémiologique', color=C['subtext'], fontsize=9)
+        ax_main.set_ylabel('Cas', color=C['subtext'], fontsize=9)
+        ax_main.legend(fontsize=7, facecolor=C['card'], edgecolor=C['border'],
+                       labelcolor=C['text'], ncol=min(4, n_dist))
+        ax_main.grid(True, alpha=0.12, color=C['border'])
+        totaux = df.groupby('district')['cas'].sum().sort_values(ascending=False)
+        colors_bar = [color_map.get(d, C['accent']) for d in totaux.index]
+        bars = ax_bar.bar(range(len(totaux)), totaux.values, color=colors_bar, edgecolor='none', alpha=0.85)
+        ax_bar.set_xticks(range(len(totaux)))
+        ax_bar.set_xticklabels([d[:14] for d in totaux.index], rotation=30, ha='right', fontsize=7, color=C['text'])
+        ax_bar.set_title("Total cumulé par district", color=C['text'], fontsize=10)
+        for bar, v in zip(bars, totaux.values):
+            ax_bar.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
+                        str(int(v)), ha='center', fontsize=7, color=C['text'])
+        ax_heat.set_title("Heatmap: cas par district × semaine", color=C['text'], fontsize=10)
+        pivot = df.pivot_table(index='district', columns='semaine', values='cas', fill_value=0)
+        im = ax_heat.imshow(pivot.values, cmap='YlOrRd', aspect='auto')
+        ax_heat.set_yticks(range(len(pivot.index)))
+        ax_heat.set_yticklabels([d[:16] for d in pivot.index], fontsize=7, color=C['text'])
+        cols = list(pivot.columns); step = max(1, len(cols)//10)
+        ax_heat.set_xticks(range(0, len(cols), step))
+        ax_heat.set_xticklabels(cols[::step], rotation=90, fontsize=6, color=C['text'])
+        plt.colorbar(im, ax=ax_heat, shrink=0.8)
+        plt.tight_layout(pad=1.0, rect=[0, 0, 1, 0.95])
+        cv = FigureCanvasTkAgg(fig, self.comp_container)
+        cv.draw(); cv.get_tk_widget().pack(fill='both', expand=True)
+        plt.close(fig)
+
+    def _afficher_tableau_synthese(self):
+        for w in self.comp_container.winfo_children(): w.destroy()
+        tk.Label(self.comp_container,
+                 text=f"📋 Tableau synthèse — Cumul annuel {self.annee_var.get()} par district et maladie",
+                 font=('Helvetica',12,'bold'), fg=C['accent'], bg=C['bg']).pack(pady=10)
+        annee = self.annee_var.get()
+        conn = self.db._conn()
+        df = pd.read_sql_query(
+            "SELECT district, maladie, SUM(cas_vivants) as total FROM donnees_consultation "
+            "WHERE annee=? AND maladie != 'Total Nouveaux consultants' AND cas_vivants > 0 "
+            "GROUP BY district, maladie ORDER BY district, total DESC",
+            conn, params=(annee,))
+        conn.close()
+        if df.empty:
+            tk.Label(self.comp_container, text="Aucune donnée disponible.",
+                     fg=C['subtext'], bg=C['bg'], font=('Helvetica',11)).pack()
+            return
+        pivot = df.pivot_table(index='maladie', columns='district', values='total', fill_value=0)
+        pivot['TOTAL'] = pivot.sum(axis=1)
+        pivot = pivot.sort_values('TOTAL', ascending=False)
+        frame_t = tk.Frame(self.comp_container, bg=C['panel'], bd=0,
+                           highlightthickness=1, highlightbackground=C['border'])
+        frame_t.pack(fill='both', expand=True, padx=16, pady=(0,16))
+        cols = ['Maladie'] + list(pivot.columns)
+        tree = ttk.Treeview(frame_t, columns=cols, show='headings', height=22)
+        tree.heading('Maladie', text='Maladie'); tree.column('Maladie', width=320, minwidth=200)
+        for col in pivot.columns:
+            tree.heading(col, text=col[:16]); tree.column(col, width=max(80, len(col)*8), minwidth=60)
+        style = ttk.Style()
+        style.configure('Synth.Treeview', background=C['card'], foreground=C['text'],
+                        fieldbackground=C['card'], rowheight=24, font=('Helvetica',9))
+        style.configure('Synth.Treeview.Heading', background=C['panel'], foreground=C['accent'],
+                        font=('Helvetica',9,'bold'))
+        tree.configure(style='Synth.Treeview')
+        tree.tag_configure('high', foreground=C['red']); tree.tag_configure('medium', foreground=C['yellow'])
+        for maladie, row in pivot.iterrows():
+            vals = [maladie] + [int(row[c]) for c in pivot.columns]
+            total = int(row['TOTAL'])
+            tag = 'high' if total > 1000 else 'medium' if total > 100 else ''
+            tree.insert('', 'end', values=vals, tags=(tag,))
+        sb_x = ttk.Scrollbar(frame_t, orient='horizontal', command=tree.xview)
+        sb_y = ttk.Scrollbar(frame_t, orient='vertical', command=tree.yview)
+        tree.configure(xscrollcommand=sb_x.set, yscrollcommand=sb_y.set)
+        tree.pack(side='left', fill='both', expand=True, padx=8, pady=8)
+        sb_y.pack(side='right', fill='y', pady=8)
+        sb_x.pack(side='bottom', fill='x', padx=8)
+
+    # ─────────────────────────────────────────────────────────────
+    # COMPARAISON INTER-ANNUELLE (nouvel onglet)
+    # ─────────────────────────────────────────────────────────────
+
+    def _build_annees(self):
+        f = self.tab_annees
+        ctrl = tk.Frame(f, bg=C['panel'], height=56)
+        ctrl.pack(fill='x'); ctrl.pack_propagate(False)
+        tk.Label(ctrl, text="Maladie :", fg=C['subtext'], bg=C['panel'],
+                 font=('Helvetica',10)).pack(side='left', padx=(16,4), pady=16)
+        self.annee_maladie_var = tk.StringVar()
+        self.annee_maladie_combo = ttk.Combobox(ctrl, textvariable=self.annee_maladie_var,
+                                                  width=44, state='readonly', font=('Helvetica',10))
+        self.annee_maladie_combo.pack(side='left', padx=4, pady=14)
+        tk.Button(ctrl, text="📊 Comparer années", font=('Helvetica',10,'bold'),
+                  bg=C['accent'], fg='black', bd=0, relief='flat', cursor='hand2',
+                  padx=14, pady=6, command=self._plot_comparaison_annees).pack(side='left', padx=12, pady=12)
+        self.annees_container = tk.Frame(f, bg=C['bg'])
+        self.annees_container.pack(fill='both', expand=True)
+
+    def _plot_comparaison_annees(self):
+        for w in self.annees_container.winfo_children(): w.destroy()
+        maladie = self.annee_maladie_var.get()
+        dist = self.district_filtre.get()
+        if not maladie:
+            tk.Label(self.annees_container, text="Sélectionnez une maladie.",
+                     fg=C['subtext'], bg=C['bg'], font=('Helvetica',12)).pack(expand=True)
+            return
+        df = self.db.get_comparaison_annees(maladie, dist if dist != 'TOUS' else None)
+        if df.empty:
+            tk.Label(self.annees_container, text="Aucune donnée multi-années disponible.\nImportez des fichiers pour plusieurs années.",
+                     fg=C['subtext'], bg=C['bg'], font=('Helvetica',12)).pack(expand=True)
+            return
+        annees = sorted(df['annee'].unique())
+        fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+        fig.patch.set_facecolor(C['bg'])
+        fig.suptitle(f"Comparaison inter-annuelle : {maladie} — {dist if dist != 'TOUS' else 'Tous districts'}",
+                     color=C['accent'], fontsize=13, fontweight='bold')
+        colors_ann = DISTRICT_COLORS[:len(annees)]
+        for ax in axes:
+            ax.set_facecolor(C['card']); ax.tick_params(colors=C['subtext'], labelsize=9)
+            ax.spines[:].set_color(C['border'])
+        # Évolution par semaine (toutes années)
+        ax1 = axes[0]
+        ax1.set_title("Courbes hebdomadaires par année", color=C['text'], fontsize=11)
+        for i, annee in enumerate(annees):
+            dfa = df[df['annee'] == annee]
+            x = [int(s[1:]) for s in dfa['semaine']]
+            ax1.plot(x, dfa['cas'], color=colors_ann[i], linewidth=2.5, marker='o', markersize=5,
+                     label=str(annee), alpha=0.9)
+        ax1.set_xlabel('Semaine épidémiologique', color=C['subtext'], fontsize=9)
+        ax1.set_ylabel('Cas', color=C['subtext'], fontsize=9)
+        ax1.legend(fontsize=10, facecolor=C['card'], edgecolor=C['border'], labelcolor=C['text'])
+        ax1.grid(True, alpha=0.15, color=C['border'])
+        # Cumulatif par année (bar)
+        ax2 = axes[1]
+        ax2.set_title("Total annuel cumulé", color=C['text'], fontsize=11)
+        totaux = df.groupby('annee')['cas'].sum()
+        bars = ax2.bar([str(a) for a in totaux.index], totaux.values,
+                       color=colors_ann[:len(totaux)], edgecolor='none', alpha=0.85, width=0.5)
+        for bar, v in zip(bars, totaux.values):
+            ax2.text(bar.get_x()+bar.get_width()/2, bar.get_height()+1,
+                     str(int(v)), ha='center', fontsize=11, fontweight='bold', color=C['text'])
+        ax2.set_ylabel('Total cas', color=C['subtext'], fontsize=9)
+        ax2.set_xlabel('Année', color=C['subtext'], fontsize=9)
+        plt.tight_layout(pad=1.2, rect=[0, 0, 1, 0.95])
+        cv = FigureCanvasTkAgg(fig, self.annees_container)
+        cv.draw(); cv.get_tk_widget().pack(fill='both', expand=True, padx=16, pady=8)
+        plt.close(fig)
+
+    # ─────────────────────────────────────────────────────────────
+    # MALADIES
+    # ─────────────────────────────────────────────────────────────
+
+    def _build_maladies(self):
+        f = self.tab_maladies
+        ctrl = tk.Frame(f, bg=C['panel'], height=56); ctrl.pack(fill='x'); ctrl.pack_propagate(False)
+        tk.Label(ctrl, text="Maladie :", fg=C['subtext'], bg=C['panel'],
+                 font=('Helvetica',10)).pack(side='left', padx=(16,4), pady=16)
+        self.maladie_var = tk.StringVar()
+        self.maladie_combo = ttk.Combobox(ctrl, textvariable=self.maladie_var,
+                                           width=44, state='readonly', font=('Helvetica',10))
+        self.maladie_combo.pack(side='left', padx=4, pady=14)
+        self.maladie_combo.bind('<<ComboboxSelected>>', lambda e: self._plot_maladie())
+        tk.Label(ctrl, text="CSB :", fg=C['subtext'], bg=C['panel'],
+                 font=('Helvetica',10)).pack(side='left', padx=(12,4), pady=16)
+        self.csb_var = tk.StringVar(value='Tous')
+        self.csb_combo_m = ttk.Combobox(ctrl, textvariable=self.csb_var,
+                                          width=22, state='readonly', font=('Helvetica',10))
+        self.csb_combo_m.pack(side='left', padx=4, pady=14)
+        self.csb_combo_m.bind('<<ComboboxSelected>>', lambda e: self._plot_maladie())
+        tk.Button(ctrl, text="🔄 Actualiser", font=('Helvetica',10), bg=C['accent'],
+                  fg='black', bd=0, relief='flat', cursor='hand2', padx=10, pady=5,
+                  command=self._refresh_maladies_tab).pack(side='left', padx=12, pady=14)
+        self.maladie_container = tk.Frame(f, bg=C['bg'])
+        self.maladie_container.pack(fill='both', expand=True)
+
+    def _refresh_maladies_tab(self):
+        annee = self.annee_var.get()
+        dist = self.district_filtre.get()
+        maladies = self.db.get_maladies_list(dist if dist != 'TOUS' else None, annee)
+        self.maladie_combo['values'] = maladies
+        if maladies and not self.maladie_var.get():
+            self.maladie_var.set(maladies[0])
+        csbs = ['Tous'] + self.db.get_csb_list(dist if dist != 'TOUS' else None, annee)
+        self.csb_combo_m['values'] = csbs
+        self._plot_maladie()
+
+    def _plot_maladie(self):
+        for w in self.maladie_container.winfo_children(): w.destroy()
+        maladie = self.maladie_var.get()
+        if not maladie: return
+        annee = self.annee_var.get()
+        dist = self.district_filtre.get()
+        csb = self.csb_var.get() if self.csb_var.get() != 'Tous' else None
+        df = self.db.get_serie_temporelle(maladie, annee, dist if dist != 'TOUS' else None, csb)
+        seuils_df = self.db.get_seuils(dist if dist != 'TOUS' else None)
+        fig = plt.figure(figsize=(15, 7.5)); fig.patch.set_facecolor(C['bg'])
+        gs = GridSpec(2, 2, figure=fig, hspace=0.45, wspace=0.3)
+        ax1 = fig.add_subplot(gs[0, :]); ax2 = fig.add_subplot(gs[1, 0]); ax3 = fig.add_subplot(gs[1, 1])
+        for ax in [ax1, ax2, ax3]:
+            ax.set_facecolor(C['card']); ax.tick_params(colors=C['subtext']); ax.spines[:].set_color(C['border'])
+        ax1.set_title(f"Évolution — {maladie} | {'Tous districts' if dist == 'TOUS' else dist} | {annee}",
+                      color=C['text'], fontsize=11)
+        if not df.empty:
+            if 'district' in df.columns and dist == 'TOUS':
+                for i, d in enumerate(df['district'].unique()):
+                    dfd = df[df['district'] == d]
+                    x = [int(s[1:]) for s in dfd['semaine']]
+                    ax1.plot(x, dfd['cas'], color=DISTRICT_COLORS[i % len(DISTRICT_COLORS)],
+                             linewidth=2, marker='o', markersize=5, label=d, alpha=0.9)
+            else:
+                if 'district' in df.columns:
+                    df_agg = df.groupby('semaine')['cas'].sum().reset_index()
+                    x = [int(s[1:]) for s in df_agg['semaine']]; y = df_agg['cas'].values
+                else:
+                    x = [int(s[1:]) for s in df['semaine']]; y = df['cas'].values
+                ax1.plot(x, y, color=C['accent'], linewidth=2.5, marker='o', markersize=6, zorder=3)
+                ax1.fill_between(x, y, alpha=0.2, color=C['accent'])
+                if dist != 'TOUS':
+                    sr = seuils_df[seuils_df['maladie'] == maladie]
+                    if not sr.empty:
+                        s_a = float(sr['seuil_alerte'].iloc[0]) if sr['seuil_alerte'].iloc[0] else None
+                        s_e = float(sr['seuil_epidemie'].iloc[0]) if sr['seuil_epidemie'].iloc[0] else None
+                        if s_a: ax1.axhline(s_a, color=C['yellow'], linewidth=1.5, linestyle='--', label=f'Alerte ({s_a:.1f})')
+                        if s_e: ax1.axhline(s_e, color=C['red'], linewidth=1.5, linestyle='--', label=f'Épidémie ({s_e:.1f})')
+        ax1.legend(fontsize=8, facecolor=C['card'], edgecolor=C['border'], labelcolor=C['text'], ncol=3)
+        ax1.set_xlabel('Semaine', color=C['subtext'], fontsize=9)
+        ax1.set_ylabel('Cas', color=C['subtext'], fontsize=9)
+        ax1.grid(True, alpha=0.15, color=C['border'])
+        ax2.set_title(f"Par CSB — {self.semaine_courante.get()}", color=C['text'], fontsize=10)
+        df_sem = self.db.get_donnees_semaine(self.semaine_courante.get(), annee, dist if dist != 'TOUS' else None)
+        df_sem = df_sem[df_sem['maladie'] == maladie].sort_values('cas', ascending=True).tail(15)
+        if not df_sem.empty:
+            labels = (df_sem['district'] + '/' + df_sem['csb']).str[:30]
+            bars = ax2.barh(range(len(labels)), df_sem['cas'], color=C['accent'], edgecolor='none', height=0.55)
+            ax2.set_yticks(range(len(labels))); ax2.set_yticklabels(labels, fontsize=7, color=C['text'])
+            for bar, v in zip(bars, df_sem['cas']):
+                ax2.text(bar.get_width()+0.1, bar.get_y()+bar.get_height()/2,
+                         str(int(v)), va='center', fontsize=7, color=C['text'])
+        else:
+            ax2.text(0.5, 0.5, 'Aucune donnée', ha='center', va='center',
+                     color=C['subtext'], fontsize=10, transform=ax2.transAxes)
+        ax3.set_title("Cas vs Décès", color=C['text'], fontsize=10)
+        if not df.empty and 'deces' in df.columns:
+            if 'district' in df.columns and dist == 'TOUS':
+                df_agg = df.groupby('semaine')[['cas','deces']].sum().reset_index()
+            else:
+                df_agg = df
+            x = [int(s[1:]) for s in df_agg['semaine']]
+            ax3.plot(x, df_agg['cas'], color=C['accent'], linewidth=2, label='Vivants', marker='o', markersize=4)
+            ax3.plot(x, df_agg['deces'], color=C['red'], linewidth=2, label='Décès', marker='x', markersize=6)
+            ax3.legend(fontsize=8, facecolor=C['card'], edgecolor=C['border'], labelcolor=C['text'])
+        plt.tight_layout(pad=1.2)
+        cv = FigureCanvasTkAgg(fig, self.maladie_container)
+        cv.draw(); cv.get_tk_widget().pack(fill='both', expand=True)
+        plt.close(fig)
+
+    # ─────────────────────────────────────────────────────────────
+    # PALUDISME
+    # ─────────────────────────────────────────────────────────────
+
+    def _build_paludisme(self):
+        f = self.tab_paludisme
+        ctrl = tk.Frame(f, bg=C['panel'], height=56); ctrl.pack(fill='x'); ctrl.pack_propagate(False)
+        tk.Label(ctrl, text="Niveau :", fg=C['subtext'], bg=C['panel'],
+                 font=('Helvetica',10)).pack(side='left', padx=(16,4), pady=16)
+        self.palu_niveau_var = tk.StringVar(value='District')
+        tk.OptionMenu(ctrl, self.palu_niveau_var, 'District', 'CSB', 'Tous districts').pack(side='left', padx=4, pady=14)
+        tk.Label(ctrl, text="CSB :", fg=C['subtext'], bg=C['panel'],
+                 font=('Helvetica',10)).pack(side='left', padx=(12,4), pady=16)
+        self.palu_csb_var = tk.StringVar(value='Tous')
+        self.palu_csb_combo = ttk.Combobox(ctrl, textvariable=self.palu_csb_var,
+                                             width=24, state='readonly', font=('Helvetica',10))
+        self.palu_csb_combo.pack(side='left', padx=4, pady=14)
+        tk.Button(ctrl, text="📊 Afficher", font=('Helvetica',10,'bold'), bg=C['accent'],
+                  fg='black', bd=0, relief='flat', cursor='hand2', padx=12, pady=5,
+                  command=self._plot_paludisme).pack(side='left', padx=12, pady=14)
+        self.palu_container = tk.Frame(f, bg=C['bg'])
+        self.palu_container.pack(fill='both', expand=True)
+
+    def _plot_paludisme(self):
+        for w in self.palu_container.winfo_children(): w.destroy()
+        annee = self.annee_var.get()
+        dist = self.district_filtre.get()
+        csb = self.palu_csb_var.get() if self.palu_csb_var.get() != 'Tous' else None
+        niveau = self.palu_niveau_var.get()
+        if niveau == 'Tous districts':
+            df = self.db.get_paludisme_serie(annee)
+        elif csb:
+            df = self.db.get_paludisme_serie(annee, csb=csb)
+        else:
+            df = self.db.get_paludisme_serie(annee, district=dist if dist != 'TOUS' else None)
+        if df.empty:
+            tk.Label(self.palu_container, text="Aucune donnée paludisme disponible.",
+                     fg=C['subtext'], bg=C['bg'], font=('Helvetica',12)).pack(expand=True)
+            return
+        fig = plt.figure(figsize=(15, 8)); fig.patch.set_facecolor(C['bg'])
+        fig.suptitle(f"🦟 Surveillance Paludisme — {annee}", color=C['accent'], fontsize=13, fontweight='bold')
+        gs = GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
+        axes = [fig.add_subplot(gs[i//3, i%3]) for i in range(6)]
+        for ax in axes:
+            ax.set_facecolor(C['card']); ax.tick_params(colors=C['subtext'], labelsize=8)
+            ax.spines[:].set_color(C['border'])
+        df_agg = df.groupby('semaine')[['fievre','palu_simple','palu_grave','deces','tdr']].sum().reset_index() if 'district' not in df.columns else \
+                 df.groupby('semaine')[['fievre','palu_simple','palu_grave','deces','tdr']].sum().reset_index()
+        x = [int(s[1:]) for s in df_agg['semaine']]
+        axes[0].set_title("Fièvre & Paludisme", color=C['text'], fontsize=10)
+        axes[0].plot(x, df_agg['fievre'], color=C['yellow'], label='Fièvre ≥37.5°C', linewidth=2)
+        axes[0].plot(x, df_agg['palu_simple'], color=C['orange'], label='Palu simple', linewidth=2)
+        axes[0].plot(x, df_agg['palu_grave'], color=C['red'], label='Palu grave', linewidth=2, linestyle='--')
+        axes[0].legend(fontsize=7, facecolor=C['card'], edgecolor=C['border'], labelcolor=C['text'])
+        axes[1].set_title("TDR effectués", color=C['text'], fontsize=10)
+        axes[1].bar(x, df_agg['tdr'], color=C['accent'], alpha=0.8, width=0.6)
+        axes[2].set_title("Décès paludisme", color=C['text'], fontsize=10)
+        axes[2].bar(x, df_agg['deces'], color=C['red'], alpha=0.85, width=0.6)
+        axes[3].set_title("Taux positivité TDR (%)", color=C['text'], fontsize=10)
+        tdr_pos = [(p/t*100 if t > 0 else 0) for p, t in zip(df_agg['palu_simple'], df_agg['tdr'])]
+        colors_pos = [C['red'] if v > 30 else C['yellow'] if v > 15 else C['green'] for v in tdr_pos]
+        axes[3].bar(x, tdr_pos, color=colors_pos, alpha=0.85, width=0.6)
+        axes[3].axhline(30, color=C['red'], linewidth=1.5, linestyle='--', label='Seuil 30%')
+        axes[3].axhline(15, color=C['yellow'], linewidth=1.5, linestyle='--', label='Seuil 15%')
+        axes[3].legend(fontsize=7, facecolor=C['card'], edgecolor=C['border'], labelcolor=C['text'])
+        axes[3].set_ylabel('%', color=C['subtext'], fontsize=8)
+        axes[4].set_title("Fièvre: confirmé vs non confirmé", color=C['text'], fontsize=10)
+        non_palu = [max(0, f-p) for f, p in zip(df_agg['fievre'], df_agg['palu_simple'])]
+        axes[4].bar(x, df_agg['palu_simple'], label='Palu confirmé', color=C['red'], alpha=0.85, width=0.6)
+        axes[4].bar(x, non_palu, bottom=df_agg['palu_simple'], label='Autres fièvres',
+                    color=C['subtext'], alpha=0.5, width=0.6)
+        axes[4].legend(fontsize=7, facecolor=C['card'], edgecolor=C['border'], labelcolor=C['text'])
+        axes[5].axis('off')
+        df_s = df_agg.tail(5)
+        if not df_s.empty:
+            table_data = [[row['semaine'], int(row['fievre']), int(row['palu_simple']),
+                           int(row['palu_grave']), int(row['tdr']),
+                           f"{row['palu_simple']/row['tdr']*100:.0f}%" if row['tdr'] > 0 else '—']
+                          for _, row in df_s.iterrows()]
+            tbl = axes[5].table(cellText=table_data,
+                                colLabels=['Sem','Fièvre','P.Simple','P.Grave','TDR','Posit.'],
+                                cellLoc='center', loc='center', bbox=[0, 0, 1, 1])
+            tbl.auto_set_font_size(False); tbl.set_fontsize(8)
+            for (r, c), cell in tbl.get_celld().items():
+                cell.set_facecolor(C['card'] if r > 0 else C['border'])
+                cell.set_text_props(color=C['text']); cell.set_edgecolor(C['border'])
+        plt.tight_layout(pad=1.0, rect=[0, 0, 1, 0.96])
+        cv = FigureCanvasTkAgg(fig, self.palu_container)
+        cv.draw(); cv.get_tk_widget().pack(fill='both', expand=True)
+        plt.close(fig)
+
+    # ─────────────────────────────────────────────────────────────
+    # ALERTES
+    # ─────────────────────────────────────────────────────────────
+
+    def _build_alertes(self):
+        f = self.tab_alertes
+        ctrl = tk.Frame(f, bg=C['panel'], height=56); ctrl.pack(fill='x'); ctrl.pack_propagate(False)
+        tk.Button(ctrl, text="🔍 Analyser semaine", font=('Helvetica',10,'bold'),
+                  bg=C['red'], fg='white', bd=0, relief='flat', cursor='hand2',
+                  padx=14, pady=6, command=self._analyser_alertes).pack(side='left', padx=16, pady=10)
+        tk.Button(ctrl, text="📊 Synthèse districts", font=('Helvetica',10),
+                  bg=C['panel'], fg=C['orange'], bd=0, relief='flat', cursor='hand2',
+                  padx=14, pady=6, command=self._afficher_synthese_alertes).pack(side='left', padx=4, pady=10)
+        tk.Button(ctrl, text="📋 Toutes alertes", font=('Helvetica',10),
+                  bg=C['panel'], fg=C['accent'], bd=0, relief='flat', cursor='hand2',
+                  padx=14, pady=6, command=self._afficher_toutes_alertes).pack(side='left', padx=4, pady=10)
+        self.alertes_info = tk.Label(ctrl, text='', fg=C['yellow'], bg=C['panel'], font=('Helvetica',10,'bold'))
+        self.alertes_info.pack(side='left', padx=16)
+        main = tk.Frame(f, bg=C['bg']); main.pack(fill='both', expand=True, padx=16, pady=10)
+        tbl_frame = tk.Frame(main, bg=C['panel'], bd=0, highlightthickness=1, highlightbackground=C['border'])
+        tbl_frame.pack(fill='both', expand=True, pady=(0,10))
+        tk.Label(tbl_frame, text="🚨 Alertes & Seuils Épidémiques — Tous Districts",
+                 font=('Helvetica',12,'bold'), fg=C['red'], bg=C['panel']).pack(anchor='w', padx=12, pady=8)
+        cols = ('District','Semaine','CSB','Maladie','Cas observés','Seuil A/E','Niveau','Date')
+        self.alertes_tree = ttk.Treeview(tbl_frame, columns=cols, show='headings', height=15)
+        widths = [120,70,140,240,100,130,90,120]
+        for col, w in zip(cols, widths):
+            self.alertes_tree.heading(col, text=col); self.alertes_tree.column(col, width=w, minwidth=60)
+        style = ttk.Style()
+        style.configure('Alert.Treeview', background=C['card'], foreground=C['text'],
+                        fieldbackground=C['card'], rowheight=26, font=('Helvetica',9))
+        style.configure('Alert.Treeview.Heading', background=C['panel'], foreground=C['accent'],
+                        font=('Helvetica',9,'bold'))
+        self.alertes_tree.configure(style='Alert.Treeview')
+        self.alertes_tree.tag_configure('epidemie', background='#4d1f1f', foreground=C['red'])
+        self.alertes_tree.tag_configure('alerte', background='#4d3c1a', foreground=C['yellow'])
+        sb = ttk.Scrollbar(tbl_frame, orient='vertical', command=self.alertes_tree.yview)
+        self.alertes_tree.configure(yscrollcommand=sb.set)
+        self.alertes_tree.pack(side='left', fill='both', expand=True, padx=8)
+        sb.pack(side='right', fill='y', pady=8)
+        self.alertes_chart_frame = tk.Frame(main, bg=C['panel'], bd=0,
+                                             highlightthickness=1, highlightbackground=C['border'], height=260)
+        self.alertes_chart_frame.pack(fill='x'); self.alertes_chart_frame.pack_propagate(False)
+
+    def _analyser_alertes(self):
+        sem = self.semaine_courante.get(); annee = self.annee_var.get()
+        dist = self.district_filtre.get()
+        alertes = self.db.detecter_alertes(sem, annee, dist if dist != 'TOUS' else None)
+        df = self.db.get_alertes(sem, annee, dist if dist != 'TOUS' else None)
+        self._peupler_alertes_tree(df)
+        self._plot_alertes_chart(df, sem)
+        n_epi = sum(1 for a in alertes if a['niveau'] == 'ÉPIDÉMIE')
+        n_alt = sum(1 for a in alertes if a['niveau'] == 'ALERTE')
+        self.alertes_info.config(text=f"🔴 {n_epi} épidémie(s) | 🟡 {n_alt} alerte(s) — {sem} {annee}")
+
+    def _afficher_toutes_alertes(self):
+        dist = self.district_filtre.get(); annee = self.annee_var.get()
+        df = self.db.get_alertes(None, annee, dist if dist != 'TOUS' else None)
+        self._peupler_alertes_tree(df)
+
+    def _afficher_synthese_alertes(self):
+        for w in self.alertes_chart_frame.winfo_children(): w.destroy()
+        annee = self.annee_var.get()
+        df = self.db.get_alertes_synthese_districts(annee)
+        if df.empty:
+            tk.Label(self.alertes_chart_frame, text="Aucune alerte enregistrée.",
+                     fg=C['green'], bg=C['panel'], font=('Helvetica',11)).pack(pady=20)
+            return
+        fig, ax = plt.subplots(figsize=(14, 2.8))
+        fig.patch.set_facecolor(C['panel']); ax.set_facecolor(C['card'])
+        districts = df['district'].unique(); x = np.arange(len(districts)); w_bar = 0.35
+        epidemies = [int(df[(df['district']==d) & (df['niveau']=='ÉPIDÉMIE')]['nb'].sum()) for d in districts]
+        alertes_l = [int(df[(df['district']==d) & (df['niveau']=='ALERTE')]['nb'].sum()) for d in districts]
+        ax.bar(x - w_bar/2, epidemies, w_bar, label='ÉPIDÉMIES', color=C['red'], alpha=0.85)
+        ax.bar(x + w_bar/2, alertes_l, w_bar, label='ALERTES', color=C['yellow'], alpha=0.85)
+        ax.set_xticks(x); ax.set_xticklabels([d[:16] for d in districts], rotation=20, ha='right', fontsize=8, color=C['text'])
+        ax.legend(fontsize=8, facecolor=C['card'], edgecolor=C['border'], labelcolor=C['text'])
+        ax.tick_params(colors=C['subtext']); ax.spines[:].set_color(C['border'])
+        ax.set_title(f"Synthèse alertes — {annee}", color=C['text'], fontsize=11)
+        plt.tight_layout(pad=0.5)
+        cv = FigureCanvasTkAgg(fig, self.alertes_chart_frame)
+        cv.draw(); cv.get_tk_widget().pack(fill='x', padx=8, pady=(0,8))
+        plt.close(fig)
+
+    def _peupler_alertes_tree(self, df):
+        for item in self.alertes_tree.get_children(): self.alertes_tree.delete(item)
+        for _, row in df.iterrows():
+            tag = 'epidemie' if row.get('niveau') == 'ÉPIDÉMIE' else 'alerte'
+            self.alertes_tree.insert('', 'end', values=(
+                row.get('district',''), row.get('semaine',''), row.get('csb','')[:20],
+                row.get('maladie','')[:45], int(row.get('valeur_observee',0)),
+                str(row.get('seuil_franchi',''))[:20], row.get('niveau',''),
+                str(row.get('created_at',''))[:16]), tags=(tag,))
+
+    def _plot_alertes_chart(self, df, semaine):
+        for w in self.alertes_chart_frame.winfo_children(): w.destroy()
+        if df.empty:
+            tk.Label(self.alertes_chart_frame, text="✅ Aucune alerte pour cette période.",
+                     fg=C['green'], bg=C['panel'], font=('Helvetica',11)).pack(pady=20)
+            return
+        fig, ax = plt.subplots(figsize=(13, 2.8))
+        fig.patch.set_facecolor(C['panel']); ax.set_facecolor(C['card'])
+        labels = (df['district'] + ' | ' + df['maladie'].str[:28]).tolist()
+        vals = df['valeur_observee'].tolist()
+        colors = [C['red'] if l == 'ÉPIDÉMIE' else C['yellow'] for l in df['niveau'].tolist()]
+        y_pos = range(len(labels))
+        ax.barh(y_pos, vals, color=colors, edgecolor='none', height=0.5)
+        ax.set_yticks(y_pos); ax.set_yticklabels(labels, fontsize=7, color=C['text'])
+        ax.tick_params(colors=C['subtext']); ax.spines[:].set_color(C['border'])
+        legend_elements = [mpatches.Patch(color=C['red'], label='ÉPIDÉMIE'),
+                           mpatches.Patch(color=C['yellow'], label='ALERTE')]
+        ax.legend(handles=legend_elements, fontsize=8, facecolor=C['card'],
+                  edgecolor=C['border'], labelcolor=C['text'])
+        plt.tight_layout(pad=0.5)
+        cv = FigureCanvasTkAgg(fig, self.alertes_chart_frame)
+        cv.draw(); cv.get_tk_widget().pack(fill='x', padx=8, pady=(0,8))
+        plt.close(fig)
+
+    # ─────────────────────────────────────────────────────────────
+    # ÉVÉNEMENTS
+    # ─────────────────────────────────────────────────────────────
+
+    def _build_evenements(self):
+        f = self.tab_evenements
+        ctrl = tk.Frame(f, bg=C['panel'], height=52); ctrl.pack(fill='x'); ctrl.pack_propagate(False)
+        tk.Button(ctrl, text="🔄 Charger", font=('Helvetica',10), bg=C['accent'],
+                  fg='black', bd=0, relief='flat', cursor='hand2', padx=10, pady=5,
+                  command=self._load_evenements).pack(side='left', padx=16, pady=10)
+        paned = tk.PanedWindow(f, orient='horizontal', bg=C['bg'], sashwidth=5)
+        paned.pack(fill='both', expand=True, padx=10, pady=10)
+        for side, title, fg_color, attr in [
+            ('left', '⚡ Événements humains', C['yellow'], 'evh_tree'),
+            ('right', '🐾 Événements animaux/environnement', C['orange'], 'eva_tree'),
+        ]:
+            fr = tk.Frame(paned, bg=C['panel'], bd=0, highlightthickness=1, highlightbackground=C['border'])
+            paned.add(fr, minsize=400)
+            tk.Label(fr, text=title, font=('Helvetica',11,'bold'), fg=fg_color, bg=C['panel']).pack(anchor='w', padx=12, pady=8)
+            if attr == 'evh_tree':
+                cols = ('District','Semaine','Événement','Vivants','Décès')
+            else:
+                cols = ('District','Semaine','Événement','Existant','Nombre')
+            tree = ttk.Treeview(fr, columns=cols, show='headings', height=20)
+            for col in cols:
+                tree.heading(col, text=col); tree.column(col, width=90)
+            tree.column('Événement', width=280); tree.configure(style='Alert.Treeview')
+            sb = ttk.Scrollbar(fr, orient='vertical', command=tree.yview)
+            tree.configure(yscrollcommand=sb.set)
+            tree.pack(side='left', fill='both', expand=True, padx=8, pady=8)
+            sb.pack(side='right', fill='y', pady=8)
+            setattr(self, attr, tree)
+
+    def _load_evenements(self):
+        annee = self.annee_var.get(); dist = self.district_filtre.get()
+        for item in self.evh_tree.get_children(): self.evh_tree.delete(item)
+        for _, row in self.db.get_evenements_humains(annee=annee, district=dist if dist != 'TOUS' else None).iterrows():
+            self.evh_tree.insert('', 'end', values=(
+                row.get('district',''), row.get('semaine',''), str(row.get('evenement',''))[:60],
+                int(row.get('vivants',0)), int(row.get('deces',0))))
+        for item in self.eva_tree.get_children(): self.eva_tree.delete(item)
+        for _, row in self.db.get_evenements_animaux(annee=annee, district=dist if dist != 'TOUS' else None).iterrows():
+            self.eva_tree.insert('', 'end', values=(
+                row.get('district',''), row.get('semaine',''), str(row.get('evenement',''))[:60],
+                int(row.get('existant',0)), int(row.get('nombre',0))))
+
+    # ─────────────────────────────────────────────────────────────
+    # COMPLÉTUDE
+    # ─────────────────────────────────────────────────────────────
+
+    def _build_completude(self):
+        f = self.tab_completude
+        ctrl = tk.Frame(f, bg=C['panel'], height=56); ctrl.pack(fill='x'); ctrl.pack_propagate(False)
+        tk.Button(ctrl, text="📊 Vue district actuel", font=('Helvetica',10), bg=C['accent'],
+                  fg='black', bd=0, relief='flat', cursor='hand2', padx=10, pady=5,
+                  command=self._plot_completude_district).pack(side='left', padx=16, pady=14)
+        tk.Button(ctrl, text="🗺️ Comparaison districts", font=('Helvetica',10,'bold'),
+                  bg=C['teal'], fg='black', bd=0, relief='flat', cursor='hand2', padx=10, pady=5,
+                  command=self._plot_completude_multiDistricts).pack(side='left', padx=8, pady=14)
+        self.completude_container = tk.Frame(f, bg=C['bg'])
+        self.completude_container.pack(fill='both', expand=True)
+
+    def _plot_completude_district(self):
+        for w in self.completude_container.winfo_children(): w.destroy()
+        annee = self.annee_var.get(); dist = self.district_filtre.get()
+        df = self.db.get_completude_serie(annee, dist if dist != 'TOUS' else None)
+        fig = plt.figure(figsize=(15, 7)); fig.patch.set_facecolor(C['bg'])
+        fig.suptitle(f"✅ Complétude — {'Tous districts' if dist == 'TOUS' else dist} — {annee}",
+                     color=C['accent'], fontsize=13, fontweight='bold')
+        gs = GridSpec(1, 2, figure=fig, wspace=0.3)
+        ax1 = fig.add_subplot(gs[0]); ax2 = fig.add_subplot(gs[1])
+        for ax in [ax1, ax2]:
+            ax.set_facecolor(C['card']); ax.tick_params(colors=C['subtext'], labelsize=8)
+            ax.spines[:].set_color(C['border'])
+        ax1.set_title("Taux de complétude par semaine", color=C['text'], fontsize=11)
+        if not df.empty:
+            if 'district' in df.columns and dist == 'TOUS':
+                for i, d in enumerate(df['district'].unique()):
+                    dfd = df[df['district'] == d]
+                    x = [int(s[1:]) for s in dfd['semaine']]
+                    taux = [r/t*100 if t > 0 else 0 for r, t in zip(dfd['rapporte'], dfd['total_fs'])]
+                    ax1.plot(x, taux, color=DISTRICT_COLORS[i % len(DISTRICT_COLORS)],
+                             linewidth=2, label=d, marker='o', markersize=4)
+                ax1.legend(fontsize=7, facecolor=C['card'], edgecolor=C['border'],
+                           labelcolor=C['text'], ncol=2)
+            else:
+                x = [int(s[1:]) for s in df['semaine']]
+                taux = [r/t*100 if t > 0 else 0 for r, t in zip(df['rapporte'], df['total_fs'])]
+                colors = [C['green'] if t >= 80 else C['yellow'] if t >= 60 else C['red'] for t in taux]
+                ax1.bar(x, taux, color=colors, alpha=0.85, width=0.6); ax1.set_ylim(0, 110)
+            ax1.axhline(80, color=C['green'], linewidth=1.5, linestyle='--', label='Cible 80%')
+            ax1.axhline(60, color=C['yellow'], linewidth=1.5, linestyle='--', label='Seuil 60%')
+            ax1.set_xlabel('Semaine', color=C['subtext'], fontsize=9)
+            ax1.set_ylabel('%', color=C['subtext'], fontsize=9)
+        ax2.set_title("Heatmap: rapport FS × Semaine", color=C['text'], fontsize=11)
+        conn = self.db._conn()
+        if dist != 'TOUS':
+            df_csb = pd.read_sql_query(
+                "SELECT csb, semaine, a_rapporte FROM completude_fs WHERE annee=? AND district=? "
+                "ORDER BY csb, CAST(SUBSTR(semaine,2) AS INTEGER)",
+                conn, params=(annee, dist))
+        else:
+            df_csb = pd.read_sql_query(
+                "SELECT district||'/'||csb as csb, semaine, a_rapporte "
+                "FROM completude_fs WHERE annee=? ORDER BY csb, CAST(SUBSTR(semaine,2) AS INTEGER)",
+                conn, params=(annee,))
+        conn.close()
+        if not df_csb.empty:
+            pivot = df_csb.pivot_table(index='csb', columns='semaine', values='a_rapporte', fill_value=0)
+            im = ax2.imshow(pivot.values, cmap='RdYlGn', aspect='auto', vmin=0, vmax=1)
+            cols = list(pivot.columns); step = max(1, len(cols)//12)
+            ax2.set_xticks(range(0, len(cols), step))
+            ax2.set_xticklabels(cols[::step], rotation=90, fontsize=6, color=C['text'])
+            ax2.set_yticks(range(len(pivot.index)))
+            ax2.set_yticklabels([c[:20] for c in pivot.index], fontsize=6, color=C['text'])
+        plt.tight_layout(pad=1.2, rect=[0, 0, 1, 0.96])
+        cv = FigureCanvasTkAgg(fig, self.completude_container)
+        cv.draw(); cv.get_tk_widget().pack(fill='both', expand=True)
+        plt.close(fig)
+
+    def _plot_completude_multiDistricts(self):
+        for w in self.completude_container.winfo_children(): w.destroy()
+        annee = self.annee_var.get()
+        df = self.db.get_completude_par_district(annee)
+        fig, ax = plt.subplots(figsize=(12, 5)); fig.patch.set_facecolor(C['bg'])
+        ax.set_facecolor(C['card'])
+        ax.set_title(f"Comparaison taux de complétude — Tous districts — {annee}",
+                     color=C['text'], fontsize=12, pad=10)
+        if not df.empty:
+            colors = [C['green'] if t >= 80 else C['yellow'] if t >= 60 else C['red'] for t in df['taux_moyen']]
+            bars = ax.bar(range(len(df)), df['taux_moyen'], color=colors, edgecolor='none', alpha=0.85)
+            ax.set_xticks(range(len(df))); ax.set_xticklabels(df['district'], rotation=30, ha='right', fontsize=9, color=C['text'])
+            for bar, v, n in zip(bars, df['taux_moyen'], df['nb_csb']):
+                ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.5,
+                        f"{v:.0f}%\n({int(n)} CSB)", ha='center', fontsize=8, color=C['text'])
+            ax.axhline(80, color=C['green'], linewidth=2, linestyle='--', label='Cible 80%')
+            ax.axhline(60, color=C['yellow'], linewidth=2, linestyle='--', label='Seuil 60%')
+            ax.set_ylim(0, 115); ax.set_ylabel('Taux moyen (%)', color=C['subtext'], fontsize=10)
+            ax.legend(fontsize=9, facecolor=C['card'], edgecolor=C['border'], labelcolor=C['text'])
+        ax.tick_params(colors=C['subtext']); ax.spines[:].set_color(C['border'])
+        ax.grid(True, alpha=0.12, color=C['border'], axis='y')
+        plt.tight_layout(pad=1.2)
+        cv = FigureCanvasTkAgg(fig, self.completude_container)
+        cv.draw(); cv.get_tk_widget().pack(fill='both', expand=True, padx=16, pady=10)
+        plt.close(fig)
+
+    # ─────────────────────────────────────────────────────────────
+    # SEUILS
+    # ─────────────────────────────────────────────────────────────
+
+    def _build_seuils(self):
+        f = self.tab_seuils
+        ctrl = tk.Frame(f, bg=C['panel'], height=56); ctrl.pack(fill='x'); ctrl.pack_propagate(False)
+        tk.Button(ctrl, text="🔄 Recalculer seuils", font=('Helvetica',10,'bold'),
+                  bg=C['orange'], fg='white', bd=0, relief='flat', cursor='hand2',
+                  padx=14, pady=6, command=self._recalculer_seuils).pack(side='left', padx=16, pady=10)
+        tk.Button(ctrl, text="📋 Afficher seuils", font=('Helvetica',10),
+                  bg=C['panel'], fg=C['accent'], bd=0, relief='flat', cursor='hand2',
+                  padx=14, pady=6, command=self._afficher_seuils).pack(side='left', padx=4, pady=10)
+        info_frame = tk.Frame(f, bg=C['panel'], bd=0, highlightthickness=1, highlightbackground=C['border'])
+        info_frame.pack(fill='x', padx=16, pady=(10,4), ipady=10)
+        tk.Label(info_frame,
+                 text="Méthode OMS — Percentile 75 (seuil d'alerte) et Percentile 90 (seuil épidémique)\n"
+                      "Calculés par district. Minimum 3 semaines de données requis.\n"
+                      "Seuils fixes appliqués pour maladies prioritaires (Choléra, Rougeole, Peste…).",
+                 font=('Helvetica',9), fg=C['subtext'], bg=C['panel'], justify='left').pack(anchor='w', padx=16)
+        main = tk.Frame(f, bg=C['bg']); main.pack(fill='both', expand=True, padx=16, pady=8)
+        tbl_f = tk.Frame(main, bg=C['panel'], bd=0, highlightthickness=1, highlightbackground=C['border'])
+        tbl_f.pack(fill='both', expand=True)
+        tk.Label(tbl_f, text="Tableau des seuils — Tous Districts",
+                 font=('Helvetica',11,'bold'), fg=C['accent'], bg=C['panel']).pack(anchor='w', padx=12, pady=8)
+        cols_s = ('District','Maladie','Seuil Alerte (P75)','Seuil Épidémie (P90)','Méthode')
+        self.seuils_tree = ttk.Treeview(tbl_f, columns=cols_s, show='headings', height=25)
+        for col, w in zip(cols_s, [140,340,160,160,160]):
+            self.seuils_tree.heading(col, text=col); self.seuils_tree.column(col, width=w)
+        self.seuils_tree.configure(style='Alert.Treeview')
+        self.seuils_tree.tag_configure('high', foreground=C['red'])
+        self.seuils_tree.tag_configure('medium', foreground=C['yellow'])
+        sb_s = ttk.Scrollbar(tbl_f, orient='vertical', command=self.seuils_tree.yview)
+        self.seuils_tree.configure(yscrollcommand=sb_s.set)
+        self.seuils_tree.pack(side='left', fill='both', expand=True, padx=8, pady=8)
+        sb_s.pack(side='right', fill='y', pady=8)
+
+    def _recalculer_seuils(self):
+        annee = self.annee_var.get(); dist = self.district_filtre.get()
+        n = self.db.calculer_et_sauver_seuils(annee, dist if dist != 'TOUS' else None)
+        messagebox.showinfo("Seuils recalculés", f"{n} seuils calculés et sauvegardés.")
+        self._afficher_seuils()
+
+    def _afficher_seuils(self):
+        for item in self.seuils_tree.get_children(): self.seuils_tree.delete(item)
+        dist = self.district_filtre.get()
+        df = self.db.get_seuils(dist if dist != 'TOUS' else None)
+        maladies_risque = ['Choléra','Rougeole','Méningite','Peste','Arbovirose']
+        for _, row in df.iterrows():
+            maladie = row['maladie']
+            tag = 'high' if any(r.lower() in maladie.lower() for r in maladies_risque) else 'medium'
+            s_a = f"{row['seuil_alerte']:.1f}" if row['seuil_alerte'] else '—'
+            s_e = f"{row['seuil_epidemie']:.1f}" if row['seuil_epidemie'] else '—'
+            self.seuils_tree.insert('', 'end', values=(
+                row.get('district','—'), maladie, s_a, s_e, row['methode']), tags=(tag,))
+
+    # ─────────────────────────────────────────────────────────────
+    # HISTORIQUE IMPORTS
+    # ─────────────────────────────────────────────────────────────
+
+    def _build_imports(self):
+        f = self.tab_imports
+        ctrl = tk.Frame(f, bg=C['panel'], height=52); ctrl.pack(fill='x'); ctrl.pack_propagate(False)
+        tk.Button(ctrl, text="🔄 Actualiser", font=('Helvetica',10), bg=C['accent'],
+                  fg='black', bd=0, relief='flat', cursor='hand2', padx=10, pady=5,
+                  command=self._load_imports).pack(side='left', padx=16, pady=10)
+        main = tk.Frame(f, bg=C['bg']); main.pack(fill='both', expand=True, padx=16, pady=10)
+        tbl_f = tk.Frame(main, bg=C['panel'], bd=0, highlightthickness=1, highlightbackground=C['border'])
+        tbl_f.pack(fill='both', expand=True)
+        tk.Label(tbl_f, text="📋 Historique des imports",
+                 font=('Helvetica',12,'bold'), fg=C['accent'], bg=C['panel']).pack(anchor='w', padx=12, pady=8)
+        cols_i = ('Région','District','Fichier','Enregistrements','Statut','Année','Source','Date import')
+        self.imports_tree = ttk.Treeview(tbl_f, columns=cols_i, show='headings', height=20)
+        for col, w in zip(cols_i, [110,130,240,120,70,70,80,150]):
+            self.imports_tree.heading(col, text=col); self.imports_tree.column(col, width=w)
+        self.imports_tree.configure(style='Alert.Treeview')
+        self.imports_tree.tag_configure('ok', foreground=C['green'])
+        self.imports_tree.tag_configure('err', foreground=C['red'])
+        sb_i = ttk.Scrollbar(tbl_f, orient='vertical', command=self.imports_tree.yview)
+        self.imports_tree.configure(yscrollcommand=sb_i.set)
+        self.imports_tree.pack(side='left', fill='both', expand=True, padx=8, pady=8)
+        sb_i.pack(side='right', fill='y', pady=8)
+
+    def _load_imports(self):
+        for item in self.imports_tree.get_children(): self.imports_tree.delete(item)
+        df = self.db.get_import_log()
+        for _, row in df.iterrows():
+            tag = 'ok' if row.get('statut') == 'OK' else 'err'
+            self.imports_tree.insert('', 'end', values=(
+                row.get('region',''), row.get('district',''), row.get('fichier',''),
+                row.get('nb_enregistrements',0), row.get('statut',''),
+                row.get('annee', ''), row.get('source_type','fichier'),
+                str(row.get('imported_at',''))[:16]), tags=(tag,))
+
+    # ─────────────────────────────────────────────────────────────
+    # UTILITAIRES
+    # ─────────────────────────────────────────────────────────────
+
+    def _refresh_filtres(self):
+        annees = self.db.get_annees_disponibles()
+        self.annee_combo['values'] = annees
+        if self.annee_var.get() not in annees and annees:
+            self.annee_var.set(annees[0])
+        annee = self.annee_var.get()
+        districts = ['TOUS'] + self.db.get_districts(annee=annee)
+        self.district_combo['values'] = districts
+        if self.user_district and self.user_district in districts:
+            self.district_filtre.set(self.user_district)
+        else:
+            self.district_filtre.set('TOUS')
+        dist = self.district_filtre.get()
+        semaines = self.db.get_semaines_disponibles(annee, dist if dist != 'TOUS' else None)
+        if not semaines:
+            semaines = [f'S{i}' for i in range(1, 54)]
+        self.sem_combo['values'] = semaines
+        if semaines: self.semaine_courante.set(semaines[0])
+
+    def _on_annee_change(self):
+        self._refresh_filtres()
+        self._load_dashboard()
+
+    def _on_district_change(self):
+        annee = self.annee_var.get(); dist = self.district_filtre.get()
+        semaines = self.db.get_semaines_disponibles(annee, dist if dist != 'TOUS' else None)
+        if not semaines: semaines = [f'S{i}' for i in range(1, 54)]
+        self.sem_combo['values'] = semaines
+        if semaines: self.semaine_courante.set(semaines[0])
+        self._load_dashboard()
+
+    def _on_semaine_change(self):
+        self._load_dashboard()
+
+    def _on_tab_change(self, event):
+        tab = self.notebook.index(self.notebook.select())
+        annee = self.annee_var.get()
+        if tab == 1:  # Compilation
+            maladies = self.db.get_maladies_list(annee=annee)
+            self.comp_maladie_combo['values'] = maladies
+            if maladies and not self.comp_maladie_var.get():
+                self.comp_maladie_var.set(maladies[0])
+        elif tab == 2:  # Comparaison années
+            maladies = self.db.get_maladies_list()
+            self.annee_maladie_combo['values'] = maladies
+            if maladies and not self.annee_maladie_var.get():
+                self.annee_maladie_var.set(maladies[0])
+        elif tab == 3:  # Maladies
+            self._refresh_maladies_tab()
+        elif tab == 4:  # Paludisme
+            dist = self.district_filtre.get()
+            self.palu_csb_combo['values'] = ['Tous'] + self.db.get_csb_list(dist if dist != 'TOUS' else None, annee)
+        elif tab == 9:  # Imports
+            self._load_imports()
+
+    def _import_excel(self):
+        paths = filedialog.askopenfilenames(
+            title="Sélectionner fichier(s) RSH Excel",
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("Tous", "*.*")])
+        if not paths: return
+        # Demander l'année
+        annee = simpledialog.askinteger("Année des données",
+            f"Année des données à importer :", initialvalue=ANNEE_COURANTE,
+            minvalue=2000, maxvalue=2100, parent=self.root)
+        if not annee: return
+        for path in paths:
+            self._import_single_file(path, annee)
+
+    def _import_single_file(self, path, annee=None):
+        annee = annee or self.annee_var.get()
+        win = tk.Toplevel(self.root)
+        win.title(f"Import — {os.path.basename(path)}")
+        win.configure(bg=C['bg']); win.transient(self.root); win.resizable(False, False)
+        tk.Label(win, text=f"📥 {os.path.basename(path)[:40]}",
+                 font=('Helvetica',12,'bold'), fg=C['accent'], bg=C['bg']).pack(pady=(16,6), padx=20)
+        tk.Label(win, text=f"Année : {annee}", font=('Helvetica',10),
+                 fg=C['yellow'], bg=C['bg']).pack()
+        msg_lbl = tk.Label(win, text="Initialisation…", font=('Helvetica',10),
+                           fg=C['text'], bg=C['bg'], wraplength=420); msg_lbl.pack(padx=20)
+        style = ttk.Style()
+        style.configure('RSH.Horizontal.TProgressbar', troughcolor=C['card'], background=C['accent'], thickness=18)
+        pbar = ttk.Progressbar(win, length=400, mode='determinate', style='RSH.Horizontal.TProgressbar')
+        pbar.pack(pady=14, padx=20)
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = self.root.winfo_x() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - h) // 2
+        win.geometry(f"{w}x{h}+{x}+{y}"); win.grab_set()
+
+        def update_progress(msg, pct):
+            try:
+                win.after(0, lambda: msg_lbl.config(text=msg))
+                win.after(0, lambda: pbar.configure(value=pct))
+            except Exception: pass
+
+        def do_import():
+            imp = ImportateurRSH(self.db, annee, update_progress)
+            ok, result, district = imp.importer_depuis_fichier(path)
+            if ok:
+                def on_success():
+                    try: win.destroy()
+                    except Exception: pass
+                    self._post_import()
+                    messagebox.showinfo("Import réussi",
+                        f"✅ {result} enregistrements importés\nDistrict : {district}\nAnnée : {annee}")
+                self.root.after(600, on_success)
+            else:
+                def on_error():
+                    try: win.destroy()
+                    except Exception: pass
+                    messagebox.showerror("Erreur d'import", f"❌ {result}")
+                self.root.after(0, on_error)
+
+        threading.Thread(target=do_import, daemon=True).start()
+
+    def _import_url(self):
+        ImportURLWindow(self.root, self.db, self.annee_var, self._post_import)
+
+    def _post_import(self):
+        self._refresh_filtres()
+        self._load_dashboard()
+        annee = self.annee_var.get()
+        maladies = self.db.get_maladies_list(annee=annee)
+        if hasattr(self, 'maladie_combo'): self.maladie_combo['values'] = maladies
+        if hasattr(self, 'comp_maladie_combo'): self.comp_maladie_combo['values'] = maladies
+        if hasattr(self, 'annee_maladie_combo'): self.annee_maladie_combo['values'] = maladies
+        if maladies:
+            if hasattr(self, 'maladie_var') and not self.maladie_var.get():
+                self.maladie_var.set(maladies[0])
+        dist = self.district_filtre.get()
+        csbs = ['Tous'] + self.db.get_csb_list(dist if dist != 'TOUS' else None, annee)
+        if hasattr(self, 'csb_combo_m'): self.csb_combo_m['values'] = csbs
+        if hasattr(self, 'palu_csb_combo'): self.palu_csb_combo['values'] = csbs
+        self._afficher_seuils()
+        self.status_bar.config(text="Import terminé. Données prêtes à analyser.")
+
+    def _open_admin_users(self):
+        AdminUsersWindow(self.root, self.db, self.user_id)
+
+    def _logout(self):
+        if messagebox.askyesno("Déconnexion", "Voulez-vous vous déconnecter ?"):
+            for widget in self.root.winfo_children(): widget.destroy()
+            self.root.title("RSH Épidémio v3 — Connexion")
+            self.root.geometry("500x660"); self.root.resizable(False, False)
+            self.root.configure(bg=C['bg'])
+            self.root.update_idletasks()
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            x, y = (sw - 500)//2, (sh - 660)//2
+            self.root.geometry(f"500x660+{x}+{y}")
+            LoginWindow(self.root, self.db)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  POINT D'ENTRÉE
+# ═══════════════════════════════════════════════════════════════
+
+def main():
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+    # Vérification dépendances
+    if not HAS_OPENPYXL:
+        import tkinter as _tk
+        _tk.Tk().withdraw()
+        messagebox.showerror("Dépendance manquante",
+            "La bibliothèque 'openpyxl' est requise.\n"
+            "Installez-la avec : pip install openpyxl")
+        return
+
+    db = DatabaseManager(DB_PATH)
+    root = tk.Tk()
+    LoginWindow(root, db)
+    root.mainloop()
+
+
+if __name__ == '__main__':
+    main()
